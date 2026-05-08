@@ -1,9 +1,7 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import sys
 import re
-import yaml
+from ruamel.yaml import YAML
+from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
@@ -166,6 +164,10 @@ def parse_sur_from_confluence(text: str) -> List[SurAttribute]:
 # ----------------------------------------------------------------------
 # Генератор YAML
 # ----------------------------------------------------------------------
+from ruamel.yaml import YAML
+from ruamel.yaml.scalarstring import DoubleQuotedScalarString
+from io import StringIO
+
 class DataVaultYamlGenerator:
     def __init__(
         self,
@@ -199,19 +201,18 @@ class DataVaultYamlGenerator:
 
     @staticmethod
     def _map_pg_to_hive(attr: SourceAttribute) -> Tuple[str, int, int]:
-        """Преобразует тип PostgreSQL в тип Hive и возвращает (hive_type, length, prec)."""
         t = attr.pg_type.lower()
-        if t in ('int2', 'int4', 'int8', 'numeric', 'decimal'):
-            return ('decimal', 38, 0)
-        if t in ('varchar', 'text', 'char'):
-            return ('string', 0, 0)
-        if t == 'date':
-            return ('date', 0, 0)
-        if t == 'timestamp':
-            return ('timestamp', 0, 0)
-        if t in ('bool', 'boolean'):
-            return ('boolean', 0, 0)
-        return ('string', 0, 0)
+        if t.startswith("int") or t.startswith("numeric") or t == "decimal":
+            return ("decimal", 38, 0)
+        if t.startswith("varchar") or t == "text" or t.startswith("char"):
+            return ("string", 0, 0)
+        if t == "date":
+            return ("date", 0, 0)
+        if t == "timestamp":
+            return ("timestamp", 0, 0)
+        if t in ("bool", "boolean"):
+            return ("boolean", 0, 0)
+        return ("string", 0, 0)
 
     def _make_attr_dict(self, name, pk_flag, typ, length, prec, desc,
                         mandatory=False, tech=False, part=False, order=None):
@@ -244,7 +245,7 @@ class DataVaultYamlGenerator:
             tech.append({"name": "tbl_part_col", "type": "string", "desc": "Поле секционирования", "is_part": True})
         return tech
 
-    # ---- Построение тела сущностей ----
+    # ------------------ Методы построения тела сущностей ------------------
     def _build_source_body(self) -> dict:
         attrs = []
         for pk in self.source_pk:
@@ -297,21 +298,21 @@ class DataVaultYamlGenerator:
 
     def _build_staging_body(self) -> dict:
         attrs = []
-        # 1. Бизнес-ключи как PK
+        # Бизнес-ключи как PK
         for bk in self.business_keys:
             src_attr = next(a for a in self.source_attrs if a.name == bk)
             hive_type, length, prec = self._map_pg_to_hive(src_attr)
             attrs.append(self._make_attr_dict(
                 name=bk, pk_flag=True, typ=hive_type, length=length, prec=prec,
                 desc=src_attr.comment, mandatory=True))
-        # 2. Поле id_pk_iar (если есть id в источнике)
+        # id_pk_iar
         id_attr = next((a for a in self.source_attrs if a.name == "id"), None)
         if id_attr:
             hive_type, length, prec = self._map_pg_to_hive(id_attr)
             attrs.append(self._make_attr_dict(
                 name="id_pk_iar", pk_flag=False, typ=hive_type, length=length, prec=prec,
                 desc=id_attr.comment, mandatory=False))
-        # 3. Остальные неключевые атрибуты (кроме бизнес-ключей и id)
+        # Остальные атрибуты (кроме бизнес-ключей и id)
         for attr in self.source_attrs:
             if attr.name in self.business_keys or attr.name == "id":
                 continue
@@ -319,7 +320,6 @@ class DataVaultYamlGenerator:
             attrs.append(self._make_attr_dict(
                 name=attr.name, pk_flag=False, typ=hive_type, length=length, prec=prec,
                 desc=attr.comment, mandatory=False))
-        # 4. Технические поля + секционирование
         for tech in self._get_tech_fields(with_partition=True):
             is_part = tech.get("is_part", False)
             attrs.append(self._make_attr_dict(
@@ -339,25 +339,21 @@ class DataVaultYamlGenerator:
 
     def _build_hub_body(self) -> dict:
         attrs = []
-        # Хэш-ключ
         attrs.append(self._make_attr_dict(
             name=self.hub_hashkey_name, pk_flag=True, typ="string", length=0, prec=0,
             desc=f"Хэш-ключ {self.description.lower()}", mandatory=True))
-        # Бизнес-ключи как обычные атрибуты
         for bk in self.business_keys:
             src_attr = next(a for a in self.source_attrs if a.name == bk)
             hive_type, length, prec = self._map_pg_to_hive(src_attr)
             attrs.append(self._make_attr_dict(
                 name=bk, pk_flag=False, typ=hive_type, length=length, prec=prec,
                 desc=src_attr.comment, mandatory=False))
-        # Служебные поля
         attrs.append(self._make_attr_dict(
             name="load_date", pk_flag=False, typ="timestamp", length=0, prec=0,
             desc="Дата загрузки", mandatory=False))
         attrs.append(self._make_attr_dict(
             name="record_source", pk_flag=False, typ="string", length=0, prec=0,
             desc="Источник записи", mandatory=False))
-        # Технические поля
         for tech in self._get_tech_fields(with_partition=False):
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
@@ -376,11 +372,9 @@ class DataVaultYamlGenerator:
 
     def _build_sat_body(self) -> dict:
         attrs = []
-        # Хэш-ключ (ссылка на хаб)
         attrs.append(self._make_attr_dict(
             name=self.hub_hashkey_name, pk_flag=True, typ="string", length=0, prec=0,
             desc=f"Хэш-ключ {self.description.lower()}", mandatory=True))
-        # Служебные поля
         attrs.append(self._make_attr_dict(
             name="load_date", pk_flag=False, typ="timestamp", length=0, prec=0,
             desc="Дата загрузки", mandatory=False))
@@ -393,7 +387,6 @@ class DataVaultYamlGenerator:
         attrs.append(self._make_attr_dict(
             name="is_deleted", pk_flag=False, typ="boolean", length=0, prec=0,
             desc="Признак удаления записи", mandatory=False))
-        # Все неключевые атрибуты из источника (кроме бизнес-ключей)
         for attr in self.source_attrs:
             if attr.name in self.business_keys:
                 continue
@@ -402,7 +395,6 @@ class DataVaultYamlGenerator:
             attrs.append(self._make_attr_dict(
                 name=name_in_sat, pk_flag=False, typ=hive_type, length=length, prec=prec,
                 desc=attr.comment, mandatory=False))
-        # Технические поля
         for tech in self._get_tech_fields(with_partition=False):
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
@@ -421,21 +413,18 @@ class DataVaultYamlGenerator:
 
     def _build_mart_body(self) -> dict:
         attrs = []
-        # Бизнес-ключи как PK
         for sa in self.sur_attrs:
             if sa.is_key:
                 attrs.append(self._make_attr_dict(
                     name=sa.name, pk_flag=True, typ=sa.hive_type,
                     length=38 if sa.hive_type == 'decimal' else 0,
                     prec=0, desc=sa.comment, mandatory=True))
-        # Неключевые поля
         for sa in self.sur_attrs:
             if not sa.is_key:
                 attrs.append(self._make_attr_dict(
                     name=sa.name, pk_flag=False, typ=sa.hive_type,
                     length=38 if sa.hive_type == 'decimal' else 0,
                     prec=0, desc=sa.comment, mandatory=False))
-        # Технические поля + секционирование
         for tech in self._get_tech_fields(with_partition=True):
             is_part = tech.get("is_part", False)
             attrs.append(self._make_attr_dict(
@@ -453,10 +442,29 @@ class DataVaultYamlGenerator:
             "attributes": {"upsert": attrs},
         }
 
-    # ---- Рендеринг с правильными разделителями ----
+    # ------------------ Рендеринг с кавычками и комментариями ------------------
     def _render_yaml_block(self, body: dict, is_source: bool = False) -> str:
-        root = {"domain": "ias_kb", "body": body}
-        yaml_str = yaml.dump(root, allow_unicode=True, sort_keys=False, indent=2)
+        # Рекурсивно оборачиваем все строки в DoubleQuotedScalarString, кроме ключей
+        def wrap_strings(obj):
+            if isinstance(obj, dict):
+                return {k: wrap_strings(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [wrap_strings(item) for item in obj]
+            if isinstance(obj, str):
+                return DoubleQuotedScalarString(obj)
+            return obj
+
+        wrapped_body = wrap_strings(body)
+        root = {"domain": "ias_kb", "body": wrapped_body}
+
+        yaml = YAML()
+        yaml.indent(mapping=2, sequence=4, offset=2)
+        yaml.default_flow_style = False
+        stream = StringIO()
+        yaml.dump(root, stream)
+        yaml_str = stream.getvalue()
+
+        # Добавляем правильный комментарий в начале
         lines = yaml_str.splitlines()
         if lines and lines[0].startswith("domain:"):
             if is_source:
@@ -465,6 +473,7 @@ class DataVaultYamlGenerator:
                 lines[0] = "# createIfNotExists entity  <-_-> \n" + lines[0]
         return "\n".join(lines)
 
+    # ------------------ Публичные методы генерации ------------------
     def generate_source(self) -> str:
         return self._render_yaml_block(self._build_source_body(), is_source=True)
 
