@@ -238,11 +238,13 @@ class DataVaultYamlGenerator:
         tech = [
             {"name": "_tech_load_dt", "type": "timestamp", "desc": "Время начала исполнения Запуска задачи"},
             {"name": "_tech_exec_job_id", "type": "string", "desc": "Идентификатор Запуска задачи"},
-            {"name": "_tech_rls_wf_dt", "type": "timestamp", "desc": "Время открытия Экземпляра потока"},
-            {"name": "_tech_rls_wf_inst_id", "type": "string", "desc": "Идентификатор Экземпляра потока"},
         ]
         if with_partition:
             tech.append({"name": "tbl_part_col", "type": "string", "desc": "Поле секционирования", "is_part": True})
+        tech.extend([
+            {"name": "_tech_rls_wf_dt", "type": "timestamp", "desc": "Время открытия Экземпляра потока"},
+            {"name": "_tech_rls_wf_inst_id", "type": "string", "desc": "Идентификатор Экземпляра потока"},
+        ])
         return tech
 
     # ------------------ Методы построения тела сущностей ------------------
@@ -444,7 +446,7 @@ class DataVaultYamlGenerator:
 
     # ------------------ Рендеринг с кавычками и комментариями ------------------
     def _render_yaml_block(self, body: dict, is_source: bool = False) -> str:
-        # Рекурсивно оборачиваем все строки в DoubleQuotedScalarString, кроме ключей
+        # Рекурсивно оборачиваем все строки в двойные кавычки
         def wrap_strings(obj):
             if isinstance(obj, dict):
                 return {k: wrap_strings(v) for k, v in obj.items()}
@@ -456,21 +458,22 @@ class DataVaultYamlGenerator:
 
         wrapped_body = wrap_strings(body)
         root = {"domain": "ias_kb", "body": wrapped_body}
+        # Принудительно оборачиваем значение domain в кавычки
+        root["domain"] = DoubleQuotedScalarString("ias_kb")
 
         yaml = YAML()
-        yaml.indent(mapping=2, sequence=4, offset=2)
+        yaml.indent(mapping=2, sequence=2, offset=0)
         yaml.default_flow_style = False
         stream = StringIO()
         yaml.dump(root, stream)
         yaml_str = stream.getvalue()
 
-        # Добавляем правильный комментарий в начале
         lines = yaml_str.splitlines()
         if lines and lines[0].startswith("domain:"):
             if is_source:
                 lines[0] = "# createIfNotExists entity \n" + lines[0]
             else:
-                lines[0] = "# createIfNotExists entity  <-_-> \n" + lines[0]
+                lines[0] = "# createIfNotExists entity <-_-> \n" + lines[0]
         return "\n".join(lines)
 
     # ------------------ Публичные методы генерации ------------------
