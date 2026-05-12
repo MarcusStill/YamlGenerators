@@ -1,16 +1,17 @@
-import sys
 import re
-from ruamel.yaml import YAML
-from ruamel.yaml.scalarstring import DoubleQuotedScalarString
-from pathlib import Path
+import sys
 from dataclasses import dataclass
+from io import StringIO
+from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel,
     QTextEdit, QLineEdit, QPushButton, QFileDialog, QMessageBox, QGroupBox,
-    QFormLayout
+    QPlainTextEdit, QTabWidget, QGridLayout
 )
+from ruamel.yaml import YAML
+from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
 
 @dataclass
@@ -164,30 +165,59 @@ def parse_sur_from_confluence(text: str) -> List[SurAttribute]:
 # ----------------------------------------------------------------------
 # Генератор YAML
 # ----------------------------------------------------------------------
-from ruamel.yaml import YAML
-from ruamel.yaml.scalarstring import DoubleQuotedScalarString
-from io import StringIO
-
 class DataVaultYamlGenerator:
     def __init__(
         self,
         domain_name: str,
+        project_prefix: str,
         source_table: str,
         source_pk: List[str],
         business_keys: List[str],
         source_attrs: List[SourceAttribute],
         sur_attrs: List[SurAttribute],
-        description: str = "",
+        source_cp: str,
+        source_ds: str,
+        source_ds_desc: str,
+        hive_cp: str,
+        hive_ds_snapshot: str,
+        hive_ds_other: str,
+        hive_ds_desc_snapshot: str,
+        hive_ds_desc_other: str,
+        description_source: str,
+        description_snapshot: str,
+        description_staging: str,
+        description_hub: str,
+        description_sat: str,
+        description_mart: str,
         hub_hashkey_name: Optional[str] = None,
     ):
         self.domain = domain_name.lower()
+        self.prefix = project_prefix.lower() if project_prefix else ""
         self.source_table = source_table
         self.source_pk = source_pk
         self.business_keys = business_keys
         self.source_attrs = source_attrs
         self.sur_attrs = sur_attrs
-        self.description = description
-        self.hub_hashkey_name = hub_hashkey_name or f"{self.domain}_hashkey"
+
+        self.source_cp = source_cp
+        self.source_ds = source_ds
+        self.source_ds_desc = source_ds_desc
+
+        self.hive_cp = hive_cp
+        self.hive_ds_snapshot = hive_ds_snapshot
+        self.hive_ds_other = hive_ds_other
+        self.hive_ds_desc_snapshot = hive_ds_desc_snapshot
+        self.hive_ds_desc_other = hive_ds_desc_other
+
+        self.desc_source = description_source
+        self.desc_snapshot = description_snapshot
+        self.desc_staging = description_staging
+        self.desc_hub = description_hub
+        self.desc_sat = description_sat
+        self.desc_mart = description_mart
+
+        base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
+        self.hub_hashkey_name = hub_hashkey_name or f"{base}_hashkey"
         self._validate()
 
     def _validate(self):
@@ -247,7 +277,7 @@ class DataVaultYamlGenerator:
         ])
         return tech
 
-    # ------------------ Методы построения тела сущностей ------------------
+    # ------------------ Построение тела сущностей ------------------
     def _build_source_body(self) -> dict:
         attrs = []
         for pk in self.source_pk:
@@ -263,13 +293,13 @@ class DataVaultYamlGenerator:
                 prec=attr.prec, desc=attr.comment, mandatory=False))
         return {
             "entityNme": self.source_table,
-            "cpNmeUnq": "cp_[postgresql]_[pk_iar]_[tm]_[readwrite]",
-            "dsNme": "dl_pk_iar",
-            "dsDesc": "Схема dl_pk_iar. БД PostgreSQL «ПК ИАР»",
+            "cpNmeUnq": self.source_cp,
+            "dsNme": self.source_ds,
+            "dsDesc": self.source_ds_desc,
             "detNmeUnq": "table",
             "destNmeUnq": "postgres",
             "ddmtNmeUnq": "source",
-            "entityDesc": self.description,
+            "entityDesc": self.desc_source,
             "attributes": {"upsert": attrs},
         }
 
@@ -285,36 +315,34 @@ class DataVaultYamlGenerator:
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
                 desc=tech["desc"], mandatory=True, tech=True))
-        entity_name = f"tgo2_{self.source_table.replace('v$', '').replace('tgo_', '')}"
+        base_name = self.source_table.replace('v$', '').replace('tgo_', '')
+        entity_name = f"tgo2_{base_name}"
         return {
             "entityNme": entity_name,
-            "cpNmeUnq": "cp_[adh3_hive]_[dp_dsb]_[]_[]",
-            "dsNme": "dl_pk_iar",
-            "dsDesc": "Схема «ПК ИАР». БД Hive Блока хранения данных Платформы данных.",
+            "cpNmeUnq": self.hive_cp,
+            "dsNme": self.hive_ds_snapshot,
+            "dsDesc": self.hive_ds_desc_snapshot,
             "detNmeUnq": "table",
             "destNmeUnq": "hive_orc",
             "ddmtNmeUnq": "snapshot",
-            "entityDesc": self.description,
+            "entityDesc": self.desc_snapshot,
             "attributes": {"upsert": attrs},
         }
 
     def _build_staging_body(self) -> dict:
         attrs = []
-        # Бизнес-ключи как PK
         for bk in self.business_keys:
             src_attr = next(a for a in self.source_attrs if a.name == bk)
             hive_type, length, prec = self._map_pg_to_hive(src_attr)
             attrs.append(self._make_attr_dict(
                 name=bk, pk_flag=True, typ=hive_type, length=length, prec=prec,
                 desc=src_attr.comment, mandatory=True))
-        # id_pk_iar
         id_attr = next((a for a in self.source_attrs if a.name == "id"), None)
         if id_attr:
             hive_type, length, prec = self._map_pg_to_hive(id_attr)
             attrs.append(self._make_attr_dict(
                 name="id_pk_iar", pk_flag=False, typ=hive_type, length=length, prec=prec,
                 desc=id_attr.comment, mandatory=False))
-        # Остальные атрибуты (кроме бизнес-ключей и id)
         for attr in self.source_attrs:
             if attr.name in self.business_keys or attr.name == "id":
                 continue
@@ -327,48 +355,63 @@ class DataVaultYamlGenerator:
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
                 desc=tech["desc"], mandatory=True, tech=True, part=is_part))
+        base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
+        entity_name = f"staging_{base}"
         return {
-            "entityNme": f"staging_cl_{self.domain}",
-            "cpNmeUnq": "cp_[adh3_hive]_[dp_dsb]_[]_[]",
-            "dsNme": "dl_iascb_tgo5",
-            "dsDesc": "Схема Риски ТГО5. БД Hive Блока хранения данных Платформы данных.",
+            "entityNme": entity_name,
+            "cpNmeUnq": self.hive_cp,
+            "dsNme": self.hive_ds_other,
+            "dsDesc": self.hive_ds_desc_other,
             "detNmeUnq": "table",
             "destNmeUnq": "hive_orc",
             "ddmtNmeUnq": "snapshotpartition",
-            "entityDesc": f"Промежуточный слой для {self.description.lower()}",
+            "entityDesc": self.desc_staging,
             "attributes": {"upsert": attrs},
         }
 
     def _build_hub_body(self) -> dict:
         attrs = []
+        # Хэш-ключ – единый для хаба и сателлита
         attrs.append(self._make_attr_dict(
-            name=self.hub_hashkey_name, pk_flag=True, typ="string", length=0, prec=0,
-            desc=f"Хэш-ключ {self.description.lower()}", mandatory=True))
+            name=self.hub_hashkey_name,
+            pk_flag=True,
+            typ="string",
+            length=0,
+            prec=0,
+            desc=f"Хэш-ключ {self.desc_hub.lower()}",
+            mandatory=True
+        ))
         for bk in self.business_keys:
             src_attr = next(a for a in self.source_attrs if a.name == bk)
             hive_type, length, prec = self._map_pg_to_hive(src_attr)
             attrs.append(self._make_attr_dict(
                 name=bk, pk_flag=False, typ=hive_type, length=length, prec=prec,
-                desc=src_attr.comment, mandatory=False))
+                desc=src_attr.comment, mandatory=False
+            ))
         attrs.append(self._make_attr_dict(
             name="load_date", pk_flag=False, typ="timestamp", length=0, prec=0,
-            desc="Дата загрузки", mandatory=False))
+            desc="Дата загрузки", mandatory=False
+        ))
         attrs.append(self._make_attr_dict(
             name="record_source", pk_flag=False, typ="string", length=0, prec=0,
-            desc="Источник записи", mandatory=False))
+            desc="Источник записи", mandatory=False
+        ))
         for tech in self._get_tech_fields(with_partition=False):
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
-                desc=tech["desc"], mandatory=True, tech=True))
+                desc=tech["desc"], mandatory=True, tech=True
+            ))
+        base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
+        entity_name = f"domain_{base}_hub"
         return {
-            "entityNme": f"domain_{self.domain}_hub",
-            "cpNmeUnq": "cp_[adh3_hive]_[dp_dsb]_[]_[]",
-            "dsNme": "dl_iascb_tgo5",
-            "dsDesc": "Схема Риски ТГО5. БД Hive Блока хранения данных Платформы данных.",
+            "entityNme": entity_name,
+            "cpNmeUnq": self.hive_cp,
+            "dsNme": self.hive_ds_other,
+            "dsDesc": self.hive_ds_desc_other,
             "detNmeUnq": "table",
             "destNmeUnq": "hive_orc",
             "ddmtNmeUnq": "factwithoutpartition",
-            "entityDesc": f"Хаб для {self.description.lower()}",
+            "entityDesc": self.desc_hub,
             "attributes": {"upsert": attrs},
         }
 
@@ -376,7 +419,7 @@ class DataVaultYamlGenerator:
         attrs = []
         attrs.append(self._make_attr_dict(
             name=self.hub_hashkey_name, pk_flag=True, typ="string", length=0, prec=0,
-            desc=f"Хэш-ключ {self.description.lower()}", mandatory=True))
+            desc=f"Хэш-ключ {self.desc_hub.lower()}", mandatory=True))
         attrs.append(self._make_attr_dict(
             name="load_date", pk_flag=False, typ="timestamp", length=0, prec=0,
             desc="Дата загрузки", mandatory=False))
@@ -401,15 +444,17 @@ class DataVaultYamlGenerator:
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
                 desc=tech["desc"], mandatory=True, tech=True))
+        base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
+        entity_name = f"domain_{base}_sat"
         return {
-            "entityNme": f"domain_{self.domain}_sat",
-            "cpNmeUnq": "cp_[adh3_hive]_[dp_dsb]_[]_[]",
-            "dsNme": "dl_iascb_tgo5",
-            "dsDesc": "Схема Риски ТГО5. БД Hive Блока хранения данных Платформы данных.",
+            "entityNme": entity_name,
+            "cpNmeUnq": self.hive_cp,
+            "dsNme": self.hive_ds_other,
+            "dsDesc": self.hive_ds_desc_other,
             "detNmeUnq": "table",
             "destNmeUnq": "hive_orc",
             "ddmtNmeUnq": "factwithoutpartition",
-            "entityDesc": f"Спутник для {self.description.lower()}",
+            "entityDesc": self.desc_sat,
             "attributes": {"upsert": attrs},
         }
 
@@ -423,6 +468,8 @@ class DataVaultYamlGenerator:
                     prec=0, desc=sa.comment, mandatory=True))
         for sa in self.sur_attrs:
             if not sa.is_key:
+                if sa.name == "tbl_part_col":
+                    continue
                 attrs.append(self._make_attr_dict(
                     name=sa.name, pk_flag=False, typ=sa.hive_type,
                     length=38 if sa.hive_type == 'decimal' else 0,
@@ -432,21 +479,22 @@ class DataVaultYamlGenerator:
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
                 desc=tech["desc"], mandatory=True, tech=True, part=is_part))
+        base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
+        entity_name = f"mart_{base}"
         return {
-            "entityNme": f"mart_{self.domain}",
-            "cpNmeUnq": "cp_[adh3_hive]_[dp_dsb]_[]_[]",
-            "dsNme": "dl_iascb_tgo5",
-            "dsDesc": "Схема Риски ТГО5. БД Hive Блока хранения данных Платформы данных.",
+            "entityNme": entity_name,
+            "cpNmeUnq": self.hive_cp,
+            "dsNme": self.hive_ds_other,
+            "dsDesc": self.hive_ds_desc_other,
             "detNmeUnq": "table",
             "destNmeUnq": "hive_orc",
             "ddmtNmeUnq": "snapshotpartition",
-            "entityDesc": f"Витрина {self.description.lower()}",
+            "entityDesc": self.desc_mart,
             "attributes": {"upsert": attrs},
         }
 
-    # ------------------ Рендеринг с кавычками и комментариями ------------------
+    # ------------------ Рендеринг YAML ------------------
     def _render_yaml_block(self, body: dict, is_source: bool = False) -> str:
-        # Рекурсивно оборачиваем все строки в двойные кавычки
         def wrap_strings(obj):
             if isinstance(obj, dict):
                 return {k: wrap_strings(v) for k, v in obj.items()}
@@ -458,7 +506,6 @@ class DataVaultYamlGenerator:
 
         wrapped_body = wrap_strings(body)
         root = {"domain": "ias_kb", "body": wrapped_body}
-        # Принудительно оборачиваем значение domain в кавычки
         root["domain"] = DoubleQuotedScalarString("ias_kb")
 
         yaml = YAML()
@@ -473,10 +520,10 @@ class DataVaultYamlGenerator:
             if is_source:
                 lines[0] = "# createIfNotExists entity \n" + lines[0]
             else:
-                lines[0] = "# createIfNotExists entity <-_-> \n" + lines[0]
+                lines[0] = "# createIfNotExists entity <-_->\n" + lines[0]
         return "\n".join(lines)
 
-    # ------------------ Публичные методы генерации ------------------
+    # ------------------ Публичные методы ------------------
     def generate_source(self) -> str:
         return self._render_yaml_block(self._build_source_body(), is_source=True)
 
@@ -520,129 +567,281 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Генератор YAML Data Vault")
-        self.setMinimumSize(950, 750)
+        self.setMinimumSize(1100, 800)
 
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
 
-        # ---- Исходные данные ----
-        source_group = QGroupBox("Перечень параметров исходных данных ПК ИАР")
-        source_layout = QVBoxLayout()
-        self.source_text = QTextEdit()
-        self.source_text.setPlaceholderText("Вставьте текст таблицы (включая заголовок) в формате Confluence...")
-        source_layout.addWidget(QLabel("Текст таблицы:"))
-        source_layout.addWidget(self.source_text)
-        self.source_business_keys = QLineEdit()
-        self.source_business_keys.setPlaceholderText("Бизнес-ключи через запятую, например: rus_name, lat_name, oksm")
-        source_layout.addWidget(QLabel("Бизнес-ключи (голубое выделение):"))
-        source_layout.addWidget(self.source_business_keys)
-        source_group.setLayout(source_layout)
-        main_layout.addWidget(source_group)
+        self.tabs = QTabWidget()
+        main_layout.addWidget(self.tabs)
 
-        # ---- Параметры СУР ----
-        sur_group = QGroupBox("Перечень параметров формируемых для СУР")
-        sur_layout = QVBoxLayout()
-        self.sur_text = QTextEdit()
-        self.sur_text.setPlaceholderText("Вставьте текст таблицы (включая заголовок) в формате Confluence...")
-        sur_layout.addWidget(QLabel("Текст таблицы:"))
-        sur_layout.addWidget(self.sur_text)
-        self.sur_business_keys = QLineEdit()
-        self.sur_business_keys.setPlaceholderText("Бизнес-ключи через запятую (обычно совпадают с исходными)")
-        sur_layout.addWidget(QLabel("Бизнес-ключи:"))
-        sur_layout.addWidget(self.sur_business_keys)
-        sur_group.setLayout(sur_layout)
-        main_layout.addWidget(sur_group)
-
-        # ---- Названия объектов ----
-        names_group = QGroupBox("Названия объектов Data Vault")
-        names_layout = QFormLayout()
-        self.source_table_name = QLineEdit("tgo_inokorgs")
-        self.hub_name = QLineEdit("domain_inok_hub")
-        self.sat_name = QLineEdit("domain_inok_sat")
-        self.mart_name = QLineEdit("mart_inok")
-        self.domain_name = QLineEdit("inok")
-        self.description = QLineEdit("Картотека ИНОК")
-        self.source_pk = QLineEdit("id")
-        names_layout.addRow("Имя исходной таблицы (source):", self.source_table_name)
-        names_layout.addRow("Имя хаба (hub):", self.hub_name)
-        names_layout.addRow("Имя спутника (sat):", self.sat_name)
-        names_layout.addRow("Имя витрины (mart):", self.mart_name)
-        names_layout.addRow("Доменное имя (для staging и ключей):", self.domain_name)
-        names_layout.addRow("Описание справочника:", self.description)
-        names_layout.addRow("Первичный ключ источника (через запятую):", self.source_pk)
-        names_group.setLayout(names_layout)
-        main_layout.addWidget(names_group)
-
-        # ---- Кнопки ----
-        btn_layout = QHBoxLayout()
-        self.generate_btn = QPushButton("Сгенерировать и сохранить...")
-        self.generate_btn.clicked.connect(self.generate_and_save)
-        self.close_btn = QPushButton("Закрыть")
-        self.close_btn.clicked.connect(self.close)
-        btn_layout.addWidget(self.generate_btn)
-        btn_layout.addWidget(self.close_btn)
-        main_layout.addLayout(btn_layout)
-
-        # ---- Лог ----
+        # Вкладки
+        self.source_tab = self._create_source_tab()
+        self.tabs.addTab(self.source_tab, "Исходные данные")
+        self.sur_tab = self._create_sur_tab()
+        self.tabs.addTab(self.sur_tab, "Данные СУР")
+        self.config_tab = self._create_config_tab()
+        self.tabs.addTab(self.config_tab, "Настройки генерации")
+        self.log_tab = QWidget()
+        log_layout = QVBoxLayout(self.log_tab)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)
-        main_layout.addWidget(QLabel("Лог:"))
-        main_layout.addWidget(self.log_text)
+        log_layout.addWidget(self.log_text)
+        self.tabs.addTab(self.log_tab, "Лог")
+
+    # ---- вкладка исходных данных ----
+    def _create_source_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(12)
+
+        layout.addWidget(QLabel("Текст таблицы (без заголовка):"))
+        self.source_text = QTextEdit()
+        self.source_text.setPlaceholderText("Вставьте строки данных (каждая запись в две строки)")
+        self.source_text.setMinimumHeight(250)
+        layout.addWidget(self.source_text)
+
+        layout.addWidget(QLabel("Заголовок таблицы (будет добавлен сверху):"))
+        self.source_header_edit = QLineEdit()
+        self.source_header_edit.setText("column name\tdata type\tidentity\tcollation\tnot null\tdefault\tcomment")
+        layout.addWidget(self.source_header_edit)
+
+        layout.addWidget(QLabel("Бизнес-ключи (через запятую):"))
+        self.source_business_keys = QLineEdit()
+        self.source_business_keys.setPlaceholderText("например: punkt")
+        layout.addWidget(self.source_business_keys)
+
+        group_source = QGroupBox("Параметры подключения source (PostgreSQL)")
+        src_layout = QGridLayout()
+        src_layout.addWidget(QLabel("cpNmeUnq:"), 0, 0)
+        self.source_cp = QLineEdit("cp_[postgresql]_[pk_iar]_[tm]_[readwrite]")
+        src_layout.addWidget(self.source_cp, 0, 1)
+        src_layout.addWidget(QLabel("dsNme:"), 1, 0)
+        self.source_ds = QLineEdit("tgo2")
+        src_layout.addWidget(self.source_ds, 1, 1)
+        src_layout.addWidget(QLabel("dsDesc:"), 2, 0)
+        self.source_ds_desc = QPlainTextEdit()
+        self.source_ds_desc.setPlainText("Cхема TGO2. БД PostgreSQL «ПК ИАР»")
+        self.source_ds_desc.setMinimumHeight(80)
+        src_layout.addWidget(self.source_ds_desc, 2, 1)
+        group_source.setLayout(src_layout)
+        layout.addWidget(group_source)
+
+        layout.addStretch()
+        return tab
+
+    # ---- вкладка СУР ----
+    def _create_sur_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(12)
+
+        layout.addWidget(QLabel("Текст таблицы (без заголовка):"))
+        self.sur_text = QTextEdit()
+        self.sur_text.setPlaceholderText("Вставьте строки данных (каждая запись в две строки)")
+        self.sur_text.setMinimumHeight(250)
+        layout.addWidget(self.sur_text)
+
+        layout.addWidget(QLabel("Заголовок таблицы:"))
+        self.sur_header_edit = QLineEdit()
+        self.sur_header_edit.setText("column name\tdata type\tidentifier\tnot null\tcomment")
+        layout.addWidget(self.sur_header_edit)
+
+        layout.addWidget(QLabel("Бизнес-ключи для СУР (через запятую):"))
+        self.sur_business_keys = QLineEdit()
+        self.sur_business_keys.setPlaceholderText("например: punkt")
+        layout.addWidget(self.sur_business_keys)
+
+        layout.addStretch()
+        return tab
+
+    # ---- вкладка настроек ----
+    def _create_config_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(12)
+
+        # Основные параметры
+        group_basic = QGroupBox("Основные параметры")
+        basic_layout = QGridLayout()
+        basic_layout.addWidget(QLabel("Префикс проекта (например 'cl'):"), 0, 0)
+        self.project_prefix = QLineEdit("cl")
+        basic_layout.addWidget(self.project_prefix, 0, 1)
+        basic_layout.addWidget(QLabel("Доменное имя (без префикса):"), 1, 0)
+        self.domain_name = QLineEdit("delivery_points_station_codes")
+        basic_layout.addWidget(self.domain_name, 1, 1)
+        basic_layout.addWidget(QLabel("Имя исходной таблицы (source):"), 2, 0)
+        self.source_table_name = QLineEdit("v$spr_stations")
+        basic_layout.addWidget(self.source_table_name, 2, 1)
+        basic_layout.addWidget(QLabel("Первичный ключ источника (через запятую):"), 3, 0)
+        self.source_pk = QLineEdit("punkt")
+        basic_layout.addWidget(self.source_pk, 3, 1)
+        group_basic.setLayout(basic_layout)
+        layout.addWidget(group_basic)
+
+        # Параметры Hive-таблиц
+        group_hive = QGroupBox("Параметры Hive-таблиц")
+        hive_layout = QGridLayout()
+        hive_layout.addWidget(QLabel("cpNmeUnq (общий):"), 0, 0)
+        self.hive_cp = QLineEdit("cp_[adh3_hive]_[dp_dsb]_[]_[]")
+        hive_layout.addWidget(self.hive_cp, 0, 1)
+        hive_layout.addWidget(QLabel("dsNme (snapshot):"), 1, 0)
+        self.hive_ds_snapshot = QLineEdit("dl_pk_iar")
+        hive_layout.addWidget(self.hive_ds_snapshot, 1, 1)
+        hive_layout.addWidget(QLabel("dsNme (staging/hub/sat/mart):"), 2, 0)
+        self.hive_ds_other = QLineEdit("dl_iascb_tgo5")
+        hive_layout.addWidget(self.hive_ds_other, 2, 1)
+        hive_layout.addWidget(QLabel("dsDesc (snapshot):"), 3, 0)
+        self.hive_ds_desc_snapshot = QPlainTextEdit()
+        self.hive_ds_desc_snapshot.setPlainText("Схема «ПК ИАР». БД Hive Блока хранения данных Платформы данных.")
+        self.hive_ds_desc_snapshot.setMinimumHeight(60)
+        hive_layout.addWidget(self.hive_ds_desc_snapshot, 3, 1)
+        hive_layout.addWidget(QLabel("dsDesc (staging/hub/sat/mart):"), 4, 0)
+        self.hive_ds_desc_other = QPlainTextEdit()
+        self.hive_ds_desc_other.setPlainText("Схема Риски ТГО5. БД Hive Блока хранения данных Платформы данных.")
+        self.hive_ds_desc_other.setMinimumHeight(60)
+        hive_layout.addWidget(self.hive_ds_desc_other, 4, 1)
+        group_hive.setLayout(hive_layout)
+        layout.addWidget(group_hive)
+
+        # Описания сущностей
+        group_desc = QGroupBox("Описания сущностей")
+        desc_layout = QGridLayout()
+        desc_layout.addWidget(QLabel("source:"), 0, 0)
+        self.desc_source = QPlainTextEdit()
+        self.desc_source.setPlainText("Справочник пунктов поставок и кодов станций")
+        desc_layout.addWidget(self.desc_source, 0, 1)
+        desc_layout.addWidget(QLabel("snapshot:"), 1, 0)
+        self.desc_snapshot = QPlainTextEdit()
+        self.desc_snapshot.setPlainText("Справочник пунктов поставок и кодов станций")
+        desc_layout.addWidget(self.desc_snapshot, 1, 1)
+        desc_layout.addWidget(QLabel("staging:"), 2, 0)
+        self.desc_staging = QPlainTextEdit()
+        self.desc_staging.setPlainText("Промежуточный слой для справочника пунктов поставок и кодов станций")
+        desc_layout.addWidget(self.desc_staging, 2, 1)
+        desc_layout.addWidget(QLabel("hub:"), 3, 0)
+        self.desc_hub = QPlainTextEdit()
+        self.desc_hub.setPlainText("Хаб для справочника пунктов поставок и кодов станций")
+        desc_layout.addWidget(self.desc_hub, 3, 1)
+        desc_layout.addWidget(QLabel("sat:"), 4, 0)
+        self.desc_sat = QPlainTextEdit()
+        self.desc_sat.setPlainText("Спутник для справочника пунктов поставок и кодов станций")
+        desc_layout.addWidget(self.desc_sat, 4, 1)
+        desc_layout.addWidget(QLabel("mart:"), 5, 0)
+        self.desc_mart = QPlainTextEdit()
+        self.desc_mart.setPlainText("Витрина справочника пунктов поставок и кодов станций")
+        desc_layout.addWidget(self.desc_mart, 5, 1)
+        group_desc.setLayout(desc_layout)
+        layout.addWidget(group_desc)
+
+        # Кнопка
+        self.generate_btn = QPushButton("Сгенерировать и сохранить...")
+        self.generate_btn.clicked.connect(self.generate_and_save)
+        layout.addWidget(self.generate_btn)
+
+        layout.addStretch()
+        return tab
 
     def log(self, msg: str, error=False):
         prefix = "[ОШИБКА] " if error else "[INFO] "
         self.log_text.append(prefix + msg)
 
     def generate_and_save(self):
-        source_text = self.source_text.toPlainText().strip()
-        sur_text = self.sur_text.toPlainText().strip()
+        # Сбор данных
+        source_data = self.source_text.toPlainText().strip()
+        sur_data = self.sur_text.toPlainText().strip()
+        source_header = self.source_header_edit.text().strip()
+        sur_header = self.sur_header_edit.text().strip()
+        if source_header:
+            source_data = source_header + "\n" + source_data
+        if sur_header:
+            sur_data = sur_header + "\n" + sur_data
+
         source_bk = [k.strip() for k in self.source_business_keys.text().split(",") if k.strip()]
         sur_bk = [k.strip() for k in self.sur_business_keys.text().split(",") if k.strip()]
 
-        if not source_text:
+        source_cp = self.source_cp.text().strip()
+        source_ds = self.source_ds.text().strip()
+        source_ds_desc = self.source_ds_desc.toPlainText().strip()
+        if not source_cp:
+            source_cp = "cp_[postgresql]_[pk_iar]_[tm]_[readwrite]"
+
+        hive_cp = self.hive_cp.text().strip()
+        hive_ds_snapshot = self.hive_ds_snapshot.text().strip()
+        hive_ds_other = self.hive_ds_other.text().strip()
+        hive_ds_desc_snapshot = self.hive_ds_desc_snapshot.toPlainText().strip()
+        hive_ds_desc_other = self.hive_ds_desc_other.toPlainText().strip()
+        if not hive_cp:
+            hive_cp = "cp_[adh3_hive]_[dp_dsb]_[]_[]"
+
+        project_prefix = self.project_prefix.text().strip()
+        domain = self.domain_name.text().strip()
+        source_table = self.source_table_name.text().strip()
+        source_pk = [pk.strip() for pk in self.source_pk.text().split(",") if pk.strip()]
+        if not source_pk:
+            source_pk = ["id"]
+
+        desc_source = self.desc_source.toPlainText().strip()
+        desc_snapshot = self.desc_snapshot.toPlainText().strip()
+        desc_staging = self.desc_staging.toPlainText().strip()
+        desc_hub = self.desc_hub.toPlainText().strip()
+        desc_sat = self.desc_sat.toPlainText().strip()
+        desc_mart = self.desc_mart.toPlainText().strip()
+
+        # Валидация
+        if not source_data:
             QMessageBox.warning(self, "Ошибка", "Введите текст исходных данных")
             return
-        if not sur_text:
+        if not sur_data:
             QMessageBox.warning(self, "Ошибка", "Введите текст СУР")
             return
         if not source_bk:
             QMessageBox.warning(self, "Ошибка", "Укажите бизнес-ключи для исходных данных")
             return
+        if not source_table or not domain:
+            QMessageBox.warning(self, "Ошибка", "Укажите имя исходной таблицы и домен")
+            return
 
+        # Парсинг
         try:
-            source_attrs = parse_source_from_confluence(source_text)
-            sur_attrs = parse_sur_from_confluence(sur_text)
+            source_attrs = parse_source_from_confluence(source_data)
+            sur_attrs = parse_sur_from_confluence(sur_data)
+            # Отладка: вывести первые комментарии
+            self.log(f"source комментарии: {[(a.name, a.comment) for a in source_attrs[:5]]}")
+            self.log(f"sur комментарии: {[(a.name, a.comment) for a in sur_attrs[:5]]}")
         except Exception as e:
             self.log(f"Ошибка парсинга: {e}", error=True)
             QMessageBox.critical(self, "Ошибка парсинга", str(e))
             return
 
-        # Устанавливаем бизнес-ключи для СУР
         for sa in sur_attrs:
             sa.is_key = sa.name in sur_bk
 
-        pk_list = [pk.strip() for pk in self.source_pk.text().split(",") if pk.strip()]
-        if not pk_list:
-            pk_list = ["id"]
-
-        source_table = self.source_table_name.text().strip()
-        domain = self.domain_name.text().strip()
-        desc = self.description.text().strip()
-        if not source_table or not domain:
-            QMessageBox.warning(self, "Ошибка", "Укажите имя исходной таблицы и домен")
-            return
-
+        # Генератор
         try:
             generator = DataVaultYamlGenerator(
                 domain_name=domain,
+                project_prefix=project_prefix,
                 source_table=source_table,
-                source_pk=pk_list,
+                source_pk=source_pk,
                 business_keys=source_bk,
                 source_attrs=source_attrs,
                 sur_attrs=sur_attrs,
-                description=desc,
+                source_cp=source_cp,
+                source_ds=source_ds,
+                source_ds_desc=source_ds_desc,
+                hive_cp=hive_cp,
+                hive_ds_snapshot=hive_ds_snapshot,
+                hive_ds_other=hive_ds_other,
+                hive_ds_desc_snapshot=hive_ds_desc_snapshot,
+                hive_ds_desc_other=hive_ds_desc_other,
+                description_source=desc_source,
+                description_snapshot=desc_snapshot,
+                description_staging=desc_staging,
+                description_hub=desc_hub,
+                description_sat=desc_sat,
+                description_mart=desc_mart,
             )
         except Exception as e:
             self.log(f"Ошибка инициализации генератора: {e}", error=True)
@@ -655,7 +854,7 @@ class MainWindow(QMainWindow):
 
         try:
             generator.save_all(folder)
-            self.log(f"YAML файлы успешно сохранены в {folder}")
+            self.log(f"YAML файлы сохранены в {folder}")
             QMessageBox.information(self, "Готово", f"YAML файлы сохранены в папку:\n{folder}")
         except Exception as e:
             self.log(f"Ошибка сохранения: {e}", error=True)
