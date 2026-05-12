@@ -7,9 +7,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QGroupBox, QFormLayout, QSpinBox)
 from ruamel.yaml import YAML
 
-# Инициализируем YAML-парсер (сохраняет порядок)
-yaml_parser = YAML(typ='safe')   # для безопасного чтения
-yaml_dumper = YAML()             # для записи (если потребуется)
+yaml_parser = YAML(typ='safe')
+yaml_dumper = YAML()
 yaml_dumper.indent(mapping=2, sequence=4, offset=2)
 
 class WorkflowGenerator(QMainWindow):
@@ -22,20 +21,18 @@ class WorkflowGenerator(QMainWindow):
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # Входные данные: YAML сущностей
         layout.addWidget(QLabel("Введите YAML сущностей Data Vault (можно несколько, разделяя ---):"))
         self.entities_edit = QTextEdit()
         self.entities_edit.setPlaceholderText("Вставьте сюда YAML...")
         layout.addWidget(self.entities_edit)
 
-        # Параметры workflow
         params_group = QGroupBox("Параметры workflow")
         form_layout = QFormLayout(params_group)
         self.wf_enabled = QCheckBox("wfEnabledFlg")
         self.wf_enabled.setChecked(False)
         form_layout.addRow("Включить поток:", self.wf_enabled)
 
-        self.wf_desc = QLineEdit("Регламент загрузки справочника")
+        self.wf_desc = QLineEdit("справочника")
         form_layout.addRow("Описание (wfDesc):", self.wf_desc)
 
         self.last_run_time = QSpinBox()
@@ -66,7 +63,6 @@ class WorkflowGenerator(QMainWindow):
 
         layout.addWidget(params_group)
 
-        # Кнопки
         btn_layout = QHBoxLayout()
         self.generate_btn = QPushButton("Сгенерировать и сохранить")
         self.close_btn = QPushButton("Закрыть")
@@ -78,11 +74,9 @@ class WorkflowGenerator(QMainWindow):
         self.close_btn.clicked.connect(self.close)
 
     def parse_entities(self, yaml_text):
-        """Разбирает YAML, содержащий несколько сущностей, с поддержкой нестрогого разделения."""
+        """Разбирает многосущностный YAML, поддерживая нестрогое разделение."""
         docs = []
-        # Пробуем стандартный сплит по ---
         parts = re.split(r'\n---\s*\n', yaml_text.strip())
-        # Если получилось много частей, пробуем загрузить каждую
         for part in parts:
             if not part.strip():
                 continue
@@ -94,9 +88,7 @@ class WorkflowGenerator(QMainWindow):
                     else:
                         docs.append(data)
             except Exception:
-                # Если стандартный сплит не помог или внутри части ошибка,
-                # разбиваем по строкам, начинающимся с "# createIfNotExists entity"
-                # и пробуем загрузить каждый блок заново
+                # Пробуем разбить по строкам, начинающимся с "# createIfNotExists entity"
                 sub_parts = re.split(r'\n(?=# createIfNotExists entity)', part)
                 for sub in sub_parts:
                     if not sub.strip():
@@ -109,12 +101,10 @@ class WorkflowGenerator(QMainWindow):
                             else:
                                 docs.append(data)
                     except Exception as e2:
-                        print(f"Не удалось загрузить блок: {sub[:100]}...\nОшибка: {e2}")
-                        # Не прерываем, просто пропускаем
+                        QMessageBox.warning(self, "Ошибка парсинга", f"Не удалось загрузить блок:\n{e2}")
         return docs
 
     def classify_entities(self, entities):
-        """Классифицирует сущности по типам."""
         classified = {
             'source': None,
             'raw': None,
@@ -129,47 +119,31 @@ class WorkflowGenerator(QMainWindow):
             dest = ent.get('destNmeUnq', '')
             name = ent.get('entityNme', '')
 
-            # Источник: ddmt = source, dest = postgres
             if ddmt == 'source' and dest == 'postgres':
                 classified['source'] = ent
-                print(f"[DEBUG] Найден источник: {name}")
-            # Сырой слой: ddmt = snapshot, ds = dl_pk_iar, dest = hive_orc
             elif ddmt == 'snapshot' and ds == 'dl_pk_iar' and dest == 'hive_orc':
                 classified['raw'] = ent
-                print(f"[DEBUG] Найден raw слой: {name}")
-            # Mart: ddmt = snapshotpartition, имя содержит mart_
             elif ddmt == 'snapshotpartition' and 'mart_' in name:
                 classified['mart'] = ent
-                print(f"[DEBUG] Найден mart: {name}")
-            # Staging: ddmt = snapshotpartition, ds = dl_iascb_tgo5, и не является mart
             elif ddmt == 'snapshotpartition' and ds == 'dl_iascb_tgo5':
                 if not classified['staging']:
                     classified['staging'] = ent
-                    print(f"[DEBUG] Найден staging: {name}")
-            # Hub: ddmt = factwithoutpartition, name заканчивается на _hub
             elif ddmt == 'factwithoutpartition' and name.endswith('_hub'):
                 classified['hub'] = ent
-                print(f"[DEBUG] Найден hub: {name}")
-            # Sat: ddmt = factwithoutpartition, name заканчивается на _sat
             elif ddmt == 'factwithoutpartition' and name.endswith('_sat'):
                 classified['sat'] = ent
-                print(f"[DEBUG] Найден sat: {name}")
         return classified
 
     def build_table_name(self, entity, is_source=False):
-        """Формирует полное имя таблицы по шаблону."""
         cp = entity.get('cpNmeUnq', '')
         ds = entity.get('dsNme', '')
         name = entity.get('entityNme', '')
         if is_source:
-            # для postgres: cp__ds__v$name
             return f"{cp}__{ds}__v${name}"
         else:
-            # для hive: cp__ds__name
             return f"{cp}__{ds}__{name}"
 
     def generate_workflow(self, classified, params):
-        """Генерирует YAML workflow в виде строки."""
         if not classified['source']:
             raise ValueError("Не найден источник (source entity)")
         if not classified['raw']:
@@ -190,7 +164,6 @@ class WorkflowGenerator(QMainWindow):
         sat = classified['sat']
         mart = classified['mart']
 
-        # Имена таблиц
         src_table = self.build_table_name(src, is_source=True)
         raw_table = self.build_table_name(raw, is_source=False)
         stg_table = self.build_table_name(stg, is_source=False)
@@ -198,7 +171,6 @@ class WorkflowGenerator(QMainWindow):
         sat_table = self.build_table_name(sat, is_source=False)
         mart_table = self.build_table_name(mart, is_source=False)
 
-        # Имена задач и сущностей (без префиксов)
         src_name = src['entityNme'].replace('v$', '')
         raw_name = raw['entityNme']
         stg_name = stg['entityNme']
@@ -206,18 +178,17 @@ class WorkflowGenerator(QMainWindow):
         sat_name = sat['entityNme']
         mart_name = mart['entityNme']
 
-        # project_name для пути task (из mart_name без mart_)
         project_name = mart_name.replace('mart_', '')
 
-        # wfNmeUnq
-        wf_name = f"wf_[postgresql]_[pk_iar]_{src['dsNme']}_2_[adh3_hive]_[ias_kb]_{raw['dsNme']}_{mart_name}"
+        # Формируем имя workflow в строгом соответствии с шаблоном
+        src_ds = src.get('dsNme', '')
+        raw_ds = raw.get('dsNme', '')
+        wf_name = f"wf_[postgresql]_[pk_iar]_[{src_ds}]_2_[adh3_hive]_[ias_kb]_[{raw_ds}]_[{mart_name}]"
 
-        # Базовые строки
         enabled = "true" if params['wf_enabled'] else "false"
         last_run = params['last_run_time']
         tags = [t.strip() for t in params['tags'].split(',') if t.strip()]
 
-        # Шаблон для задачи import
         import_task = f"""
       - tskNme: "tsk_import_[{raw['dsNme']}]_[{raw_name}]_[snapshot_full]"
         tskEnabledFlg: true
@@ -246,7 +217,6 @@ class WorkflowGenerator(QMainWindow):
           add:
             - {params['restart_rule']}"""
 
-        # Шаблон для staging
         staging_task = f"""
       - tskNme: "tsk_transform_[{stg['dsNme']}]_[{stg_name}]_[snapshotpartition_full]"
         tskEnabledFlg: true
@@ -286,7 +256,6 @@ class WorkflowGenerator(QMainWindow):
           add:
             - {params['restart_rule']}"""
 
-        # Hub
         hub_task = f"""
       - tskNme: "tsk_transform_[{hub['dsNme']}]_[{hub_name}]_[factwithoutpartition_full]"
         tskEnabledFlg: true
@@ -330,7 +299,6 @@ class WorkflowGenerator(QMainWindow):
           add:
             - {params['restart_rule']}"""
 
-        # Sat
         sat_task = f"""
       - tskNme: "tsk_transform_[{sat['dsNme']}]_[{sat_name}]_[factwithoutpartition_full]"
         tskEnabledFlg: true
@@ -378,7 +346,6 @@ class WorkflowGenerator(QMainWindow):
           add:
             - {params['restart_rule']}"""
 
-        # Mart
         mart_task = f"""
       - tskNme: "tsk_transform_[{mart['dsNme']}]_[{mart_name}]_[snapshotpartition_full]"
         tskEnabledFlg: true
@@ -422,7 +389,6 @@ class WorkflowGenerator(QMainWindow):
           add:
             - {params['restart_rule']}"""
 
-        # Собираем полный YAML
         tags_yaml = ""
         if tags:
             tags_yaml = "\n    add:\n" + "\n".join(f"      - {t}" for t in tags)
@@ -459,10 +425,11 @@ body:
             QMessageBox.warning(self, "Нет данных", "Введите YAML сущностей.")
             return
 
-        # Парсим сущности через ruamel.yaml
         entities = self.parse_entities(yaml_text)
         if not entities:
             return
+
+        # Проверим, что все сущности распознаны и дадим предупреждение о неверном dsNme источника
         classified = self.classify_entities(entities)
 
         missing = [k for k, v in classified.items() if v is None]
@@ -470,11 +437,22 @@ body:
             QMessageBox.warning(self, "Неполные данные", f"Не найдены сущности: {', '.join(missing)}")
             return
 
+        src = classified['source']
+        if src.get('dsNme') != 'tgo2':
+            reply = QMessageBox.warning(
+                self, "Некорректная схема источника",
+                f"У сущности источника dsNme = '{src.get('dsNme')}', ожидается 'tgo2'.\n"
+                "Продолжить генерацию? (оркестратор может отклонить workflow)",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+
         params = {
             'wf_enabled': self.wf_enabled.isChecked(),
-            'wf_desc': self.wf_desc.text() or "Справочник",
+            'wf_desc': self.wf_desc.text(),
             'last_run_time': self.last_run_time.value(),
-            'tags': self.tags.text() or "tgo5",
+            'tags': self.tags.text(),
             'task_launcher': self.task_launcher.text(),
             'app_import': self.app_import.text(),
             'resource': self.resource.text(),
