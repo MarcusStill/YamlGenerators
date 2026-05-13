@@ -32,8 +32,11 @@ class WorkflowGenerator(QMainWindow):
         self.wf_enabled.setChecked(False)
         form_layout.addRow("Включить поток:", self.wf_enabled)
 
-        self.wf_desc = QLineEdit("справочника")
+        self.wf_desc = QLineEdit("Регламент загрузки из <ПК ИАР> в ОД cправочника < название >")
         form_layout.addRow("Описание (wfDesc):", self.wf_desc)
+
+        self.ref_name = QLineEdit("картотека инок")
+        form_layout.addRow("Название справочника:", self.ref_name)
 
         self.last_run_time = QSpinBox()
         self.last_run_time.setRange(0, 10080)
@@ -139,24 +142,16 @@ class WorkflowGenerator(QMainWindow):
         ds = entity.get('dsNme', '')
         name = entity.get('entityNme', '')
         if is_source:
-            return f"{cp}__{ds}__v${name}"
+            # Добавляем 'v$' только если имя сущности начинается с 'v$'
+            if name.startswith('v$'):
+                return f"{cp}__{ds}__{name}"
+            else:
+                return f"{cp}__{ds}__{name}"
         else:
             return f"{cp}__{ds}__{name}"
 
     def generate_workflow(self, classified, params):
-        if not classified['source']:
-            raise ValueError("Не найден источник (source entity)")
-        if not classified['raw']:
-            raise ValueError("Не найден сырой слой (raw snapshot entity)")
-        if not classified['staging']:
-            raise ValueError("Не найдена staging сущность")
-        if not classified['hub']:
-            raise ValueError("Не найдена hub сущность")
-        if not classified['sat']:
-            raise ValueError("Не найдена sat сущность (обязательна для полного Data Vault)")
-        if not classified['mart']:
-            raise ValueError("Не найдена mart сущность")
-
+        # ---- получение данных из classified ----
         src = classified['source']
         raw = classified['raw']
         stg = classified['staging']
@@ -164,6 +159,7 @@ class WorkflowGenerator(QMainWindow):
         sat = classified['sat']
         mart = classified['mart']
 
+        # имена таблиц
         src_table = self.build_table_name(src, is_source=True)
         raw_table = self.build_table_name(raw, is_source=False)
         stg_table = self.build_table_name(stg, is_source=False)
@@ -171,7 +167,6 @@ class WorkflowGenerator(QMainWindow):
         sat_table = self.build_table_name(sat, is_source=False)
         mart_table = self.build_table_name(mart, is_source=False)
 
-        src_name = src['entityNme'].replace('v$', '')
         raw_name = raw['entityNme']
         stg_name = stg['entityNme']
         hub_name = hub['entityNme']
@@ -179,245 +174,268 @@ class WorkflowGenerator(QMainWindow):
         mart_name = mart['entityNme']
 
         project_name = mart_name.replace('mart_', '')
-
-        # Формируем имя workflow в строгом соответствии с шаблоном
         src_ds = src.get('dsNme', '')
         raw_ds = raw.get('dsNme', '')
+        stg_ds = stg.get('dsNme', '')
+        hub_ds = hub.get('dsNme', '')
+        sat_ds = sat.get('dsNme', '')
+        mart_ds = mart.get('dsNme', '')
+
         wf_name = f"wf_[postgresql]_[pk_iar]_[{src_ds}]_2_[adh3_hive]_[ias_kb]_[{raw_ds}]_[{mart_name}]"
-
         enabled = "true" if params['wf_enabled'] else "false"
-        last_run = params['last_run_time']
+        last_run = str(params['last_run_time'])
         tags = [t.strip() for t in params['tags'].split(',') if t.strip()]
+        ref_name = params.get('reference_name', 'справочника')
 
-        import_task = f"""
-      - tskNme: "tsk_import_[{raw['dsNme']}]_[{raw_name}]_[snapshot_full]"
-        tskEnabledFlg: true
-        tskMandatoryFlg: true
-        tskRestartFlg: true
-        tskDesc: "Загрузка {params['wf_desc']} в слой {raw['dsNme']}"
-        dtltNmeUnq: FULL__OVERWRITE
-        grpNmeUnq: grp_spark_common_livy
-        parameters:
-          upsert:
-            - paramNme: sourceTable
-              paramTyp: ENTITY
-              paramVal: "{src_table}"
-              paramEtlDirectionTyp: SRC
-            - paramNme: targetTable
-              paramTyp: ENTITY
-              paramVal: "{raw_table}"
-              paramEtlDirectionTyp: TRG
-            - paramNme: application
-              paramTyp: PARAMETER_GROUP
-              paramVal: "{params['app_import']}"
-            - paramNme: resource
-              paramTyp: PARAMETER_GROUP
-              paramVal: "{params['resource']}"
-        taskRestartRuleLinks:
-          add:
-            - {params['restart_rule']}"""
+        import_desc = f"Загрузка справочника {ref_name} в слой ПК ИАР ОД"
+        staging_desc = f"Расчёт staging слоя витрины 'Справочник {ref_name}' ТГО.СУР"
+        hub_desc = f"Расчёт domain hub слоя витрины 'Справочник {ref_name}' ТГО.СУР"
+        sat_desc = f"Расчёт domain sat слоя витрины 'Справочник {ref_name}' ТГО.СУР"
+        mart_desc = f"Расчёт витрины 'Справочник {ref_name}'"
 
-        staging_task = f"""
-      - tskNme: "tsk_transform_[{stg['dsNme']}]_[{stg_name}]_[snapshotpartition_full]"
-        tskEnabledFlg: true
-        tskMandatoryFlg: true
-        tskRestartFlg: true
-        tskDesc: "Расчёт staging слоя '{params['wf_desc']}'"
-        dtltNmeUnq: FULL__APPEND
-        grpNmeUnq: grp_spark_common_livy
-        parameters:
-          upsert:
-            - paramNme: task
-              paramTyp: NORMAL
-              paramVal: "tgo5/{project_name}/hive_{stg['dsNme']}_{stg_name}"
-            - paramNme: targetTable
-              paramTyp: ENTITY
-              paramVal: "{stg_table}"
-              paramEtlDirectionTyp: TRG
-            - paramNme: tbl_{raw_name}
-              paramTyp: TABLE_NAME
-              paramVal: "{raw_table}"
-              paramEtlDirectionTyp: SRC
-            - paramNme: common_application
-              paramTyp: PARAMETER_GROUP
-              paramVal: "{params['common_app']}"
-            - paramNme: application
-              paramTyp: PARAMETER_GROUP
-              paramVal: "{params['app_transform']}"
-            - paramNme: mode
-              paramTyp: NORMAL
-              paramVal: "append"
-        conditions:
-          upsert:
-            - depTyp: "parentTasks"
-              depParents:
-                - "tsk_import_[{raw['dsNme']}]_[{raw_name}]_[snapshot_full]"
-        taskRestartRuleLinks:
-          add:
-            - {params['restart_rule']}"""
+        import_tsk = f"tsk_import_[{raw_ds}]_[{raw_name}]_[snapshot_full]"
+        staging_tsk = f"tsk_transform_[{stg_ds}]_[{stg_name}]_[snapshotpartition_full]"
+        hub_tsk = f"tsk_transform_[{hub_ds}]_[{hub_name}]_[factwithoutpartition_full]"
+        sat_tsk = f"tsk_transform_[{sat_ds}]_[{sat_name}]_[factwithoutpartition_full]"
+        mart_tsk = f"tsk_transform_[{mart_ds}]_[{mart_name}]_[snapshotpartition_full]"
 
-        hub_task = f"""
-      - tskNme: "tsk_transform_[{hub['dsNme']}]_[{hub_name}]_[factwithoutpartition_full]"
-        tskEnabledFlg: true
-        tskMandatoryFlg: true
-        tskRestartFlg: true
-        tskDesc: "Расчёт domain hub слоя '{params['wf_desc']}'"
-        dtltNmeUnq: FULL__APPEND
-        grpNmeUnq: grp_spark_common_livy
-        parameters:
-          upsert:
-            - paramNme: task
-              paramTyp: NORMAL
-              paramVal: "tgo5/{project_name}/hive_{hub['dsNme']}_{hub_name}"
-            - paramNme: targetTable
-              paramTyp: ENTITY
-              paramVal: "{hub_table}"
-              paramEtlDirectionTyp: TRG
-            - paramNme: tbl_{stg_name}
-              paramTyp: TABLE_NAME
-              paramVal: "{stg_table}"
-              paramEtlDirectionTyp: SRC
-            - paramNme: tbl_{hub_name}
-              paramTyp: TABLE_NAME
-              paramVal: "{hub_table}"
-              paramEtlDirectionTyp: SRC
-            - paramNme: common_application
-              paramTyp: PARAMETER_GROUP
-              paramVal: "{params['common_app']}"
-            - paramNme: application
-              paramTyp: PARAMETER_GROUP
-              paramVal: "{params['app_transform']}"
-            - paramNme: mode
-              paramTyp: NORMAL
-              paramVal: "append"
-        conditions:
-          upsert:
-            - depTyp: "parentTasks"
-              depParents:
-                - "tsk_transform_[{stg['dsNme']}]_[{stg_name}]_[snapshotpartition_full]"
-        taskRestartRuleLinks:
-          add:
-            - {params['restart_rule']}"""
+        staging_task_val = f"tgo5/{project_name}/hive_{stg_ds}_{stg_name}"
+        hub_task_val = f"tgo5/{project_name}/hive_{hub_ds}_{hub_name}"
+        sat_task_val = f"tgo5/{project_name}/hive_{sat_ds}_{sat_name}"
+        mart_task_val = f"tgo5/{project_name}/hive_{mart_ds}_{mart_name}"
 
-        sat_task = f"""
-      - tskNme: "tsk_transform_[{sat['dsNme']}]_[{sat_name}]_[factwithoutpartition_full]"
-        tskEnabledFlg: true
-        tskMandatoryFlg: true
-        tskRestartFlg: true
-        tskDesc: "Расчёт domain sat слоя '{params['wf_desc']}'"
-        dtltNmeUnq: FULL__APPEND
-        grpNmeUnq: grp_spark_common_livy
-        parameters:
-          upsert:
-            - paramNme: task
-              paramTyp: NORMAL
-              paramVal: "tgo5/{project_name}/hive_{sat['dsNme']}_{sat_name}"
-            - paramNme: targetTable
-              paramTyp: ENTITY
-              paramVal: "{sat_table}"
-              paramEtlDirectionTyp: TRG
-            - paramNme: tbl_{stg_name}
-              paramTyp: TABLE_NAME
-              paramVal: "{stg_table}"
-              paramEtlDirectionTyp: SRC
-            - paramNme: tbl_{hub_name}
-              paramTyp: TABLE_NAME
-              paramVal: "{hub_table}"
-              paramEtlDirectionTyp: SRC
-            - paramNme: tbl_{sat_name}
-              paramTyp: TABLE_NAME
-              paramVal: "{sat_table}"
-              paramEtlDirectionTyp: SRC
-            - paramNme: common_application
-              paramTyp: PARAMETER_GROUP
-              paramVal: "{params['common_app']}"
-            - paramNme: application
-              paramTyp: PARAMETER_GROUP
-              paramVal: "{params['app_transform']}"
-            - paramNme: mode
-              paramTyp: NORMAL
-              paramVal: "append"
-        conditions:
-          upsert:
-            - depTyp: "parentTasks"
-              depParents:
-                - "tsk_transform_[{hub['dsNme']}]_[{hub_name}]_[factwithoutpartition_full]"
-        taskRestartRuleLinks:
-          add:
-            - {params['restart_rule']}"""
+        task_launcher = params['task_launcher']
+        app_import = params['app_import']
+        resource = params['resource']
+        common_app = params['common_app']
+        app_transform = params['app_transform']
+        restart_rule = params['restart_rule']
 
-        mart_task = f"""
-      - tskNme: "tsk_transform_[{mart['dsNme']}]_[{mart_name}]_[snapshotpartition_full]"
-        tskEnabledFlg: true
-        tskMandatoryFlg: true
-        tskRestartFlg: true
-        tskDesc: "Расчёт витрины '{params['wf_desc']}'"
-        dtltNmeUnq: FULL__APPEND
-        grpNmeUnq: grp_spark_common_livy
-        parameters:
-          upsert:
-            - paramNme: task
-              paramTyp: NORMAL
-              paramVal: "tgo5/{project_name}/hive_{mart['dsNme']}_{mart_name}"
-            - paramNme: targetTable
-              paramTyp: ENTITY
-              paramVal: "{mart_table}"
-              paramEtlDirectionTyp: TRG
-            - paramNme: tbl_{hub_name}
-              paramTyp: TABLE_NAME
-              paramVal: "{hub_table}"
-              paramEtlDirectionTyp: SRC
-            - paramNme: tbl_{sat_name}
-              paramTyp: TABLE_NAME
-              paramVal: "{sat_table}"
-              paramEtlDirectionTyp: SRC
-            - paramNme: common_application
-              paramTyp: PARAMETER_GROUP
-              paramVal: "{params['common_app']}"
-            - paramNme: application
-              paramTyp: PARAMETER_GROUP
-              paramVal: "{params['app_transform']}"
-            - paramNme: mode
-              paramTyp: NORMAL
-              paramVal: "append"
-        conditions:
-          upsert:
-            - depTyp: "parentTasks"
-              depParents:
-                - "tsk_transform_[{sat['dsNme']}]_[{sat_name}]_[factwithoutpartition_full]"
-        taskRestartRuleLinks:
-          add:
-            - {params['restart_rule']}"""
-
-        tags_yaml = ""
+        # ---- теги ----
         if tags:
-            tags_yaml = "\n    add:\n" + "\n".join(f"      - {t}" for t in tags)
+            tag_section = "  tagLinks:\n    add:\n" + "\n".join(f"      - {t}" for t in tags)
+        else:
+            tag_section = ""
 
-        workflow = f"""# createIfNotExists workflow <-_->
-domain: "ias_kb"
-body:
-  wfNmeUnq: {wf_name}
-  wfTyp: DATA
-  wfDesc: "{params['wf_desc']}"
-  wfEnabledFlg: {enabled}
-  parameters:
-    upsert:
-      - paramNme: task_launcher_type
-        paramTyp: NORMAL
-        paramVal: "{params['task_launcher']}"
-        paramDesc: "Параметр для замены связи с Глобальным параметром"
+        # ---- шаблон – полная копия вашего эталона с плейсхолдерами ----
+        # (все отступы и пустые строки сохранены)
+        yaml_template = f'''# createIfNotExists workflow <-_->
+    domain: "ias_kb"
+    body:
+      wfNmeUnq: {wf_name}
+      wfTyp: DATA
+      wfDesc: "{params['wf_desc']}"
+      wfEnabledFlg: {enabled}
+      parameters:
+        upsert:
+          - paramNme: task_launcher_type
+            paramTyp: NORMAL
+            paramVal: "{task_launcher}"
+            paramDesc: "Параметр для замены связи с Глобальным параметром"
 
-  conditions:
-    upsert:
-      - depTyp: "lastRunTime"
-        depValue: "{last_run}"
+      conditions:
+        upsert:
+          - depTyp: "lastRunTime"
+            depValue: "{last_run}"
 
-  tagLinks:{tags_yaml}
+    {tag_section}
+      tasks:
+        upsert:
+          - tskNme: "{import_tsk}"
+            tskEnabledFlg: true
+            tskMandatoryFlg: true
+            tskRestartFlg: true
+            tskDesc: "{import_desc}"
+            dtltNmeUnq: FULL__OVERWRITE
+            grpNmeUnq: grp_spark_common_livy
+            parameters:
+              upsert:
+                - paramNme: sourceTable
+                  paramTyp: ENTITY
+                  paramVal: "{src_table}"
+                  paramEtlDirectionTyp: SRC
+                - paramNme: targetTable
+                  paramTyp: ENTITY
+                  paramVal: "{raw_table}"
+                  paramEtlDirectionTyp: TRG
+                - paramNme: application
+                  paramTyp: PARAMETER_GROUP
+                  paramVal: "{app_import}"
+                - paramNme: resource
+                  paramTyp: PARAMETER_GROUP
+                  paramVal: "{resource}"
+            taskRestartRuleLinks:
+              add:
+                - {restart_rule}
 
-  tasks:
-    upsert:{import_task}{staging_task}{hub_task}{sat_task}{mart_task}
-"""
-        return workflow
+          - tskNme: "{staging_tsk}"
+            tskEnabledFlg: true
+            tskMandatoryFlg: true
+            tskRestartFlg: true
+            tskDesc: "{staging_desc}"
+            dtltNmeUnq: FULL__APPEND
+            grpNmeUnq: grp_spark_common_livy
+            parameters:
+              upsert:
+                - paramNme: task
+                  paramTyp: NORMAL
+                  paramVal: "{staging_task_val}"
+                - paramNme: targetTable
+                  paramTyp: ENTITY
+                  paramVal: "{stg_table}"
+                  paramEtlDirectionTyp: TRG
+                - paramNme: tbl_{raw_name}
+                  paramTyp: TABLE_NAME
+                  paramVal: "{raw_table}"
+                  paramEtlDirectionTyp: SRC
+                - paramNme: common_application
+                  paramTyp: PARAMETER_GROUP
+                  paramVal: "{common_app}"
+                - paramNme: application
+                  paramTyp: PARAMETER_GROUP
+                  paramVal: "{app_transform}"
+                - paramNme: mode
+                  paramTyp: NORMAL
+                  paramVal: "append"
+            conditions:
+              upsert:
+                - depTyp: "parentTasks"
+                  depParents:
+                    - "{import_tsk}"
+            taskRestartRuleLinks:
+              add:
+                - {restart_rule}
+
+          - tskNme: "{hub_tsk}"
+            tskEnabledFlg: true
+            tskMandatoryFlg: true
+            tskRestartFlg: true
+            tskDesc: "{hub_desc}"
+            dtltNmeUnq: FULL__APPEND
+            grpNmeUnq: grp_spark_common_livy
+            parameters:
+              upsert:
+                - paramNme: task
+                  paramTyp: NORMAL
+                  paramVal: "{hub_task_val}"
+                - paramNme: targetTable
+                  paramTyp: ENTITY
+                  paramVal: "{hub_table}"
+                  paramEtlDirectionTyp: TRG
+                - paramNme: tbl_{stg_name}
+                  paramTyp: TABLE_NAME
+                  paramVal: "{stg_table}"
+                  paramEtlDirectionTyp: SRC
+                - paramNme: tbl_{hub_name}
+                  paramTyp: TABLE_NAME
+                  paramVal: "{hub_table}"
+                  paramEtlDirectionTyp: SRC
+                - paramNme: common_application
+                  paramTyp: PARAMETER_GROUP
+                  paramVal: "{common_app}"
+                - paramNme: application
+                  paramTyp: PARAMETER_GROUP
+                  paramVal: "{app_transform}"
+                - paramNme: mode
+                  paramTyp: NORMAL
+                  paramVal: "append"
+            conditions:
+              upsert:
+                - depTyp: "parentTasks"
+                  depParents:
+                    - "{staging_tsk}"
+            taskRestartRuleLinks:
+              add:
+                - {restart_rule}
+
+          - tskNme: "{sat_tsk}"
+            tskEnabledFlg: true
+            tskMandatoryFlg: true
+            tskRestartFlg: true
+            tskDesc: "{sat_desc}"
+            dtltNmeUnq: FULL__APPEND
+            grpNmeUnq: grp_spark_common_livy
+            parameters:
+              upsert:
+                - paramNme: task
+                  paramTyp: NORMAL
+                  paramVal: "{sat_task_val}"
+                - paramNme: targetTable
+                  paramTyp: ENTITY
+                  paramVal: "{sat_table}"
+                  paramEtlDirectionTyp: TRG
+                - paramNme: tbl_{stg_name}
+                  paramTyp: TABLE_NAME
+                  paramVal: "{stg_table}"
+                  paramEtlDirectionTyp: SRC
+                - paramNme: tbl_{hub_name}
+                  paramTyp: TABLE_NAME
+                  paramVal: "{hub_table}"
+                  paramEtlDirectionTyp: SRC
+                - paramNme: tbl_{sat_name}
+                  paramTyp: TABLE_NAME
+                  paramVal: "{sat_table}"
+                  paramEtlDirectionTyp: SRC
+                - paramNme: common_application
+                  paramTyp: PARAMETER_GROUP
+                  paramVal: "{common_app}"
+                - paramNme: application
+                  paramTyp: PARAMETER_GROUP
+                  paramVal: "{app_transform}"
+                - paramNme: mode
+                  paramTyp: NORMAL
+                  paramVal: "append"
+            conditions:
+              upsert:
+                - depTyp: "parentTasks"
+                  depParents:
+                    - "{hub_tsk}"
+            taskRestartRuleLinks:
+              add:
+                - {restart_rule}
+
+          - tskNme: "{mart_tsk}"
+            tskEnabledFlg: true
+            tskMandatoryFlg: true
+            tskRestartFlg: true
+            tskDesc: "{mart_desc}"
+            dtltNmeUnq: FULL__APPEND
+            grpNmeUnq: grp_spark_common_livy
+            parameters:
+              upsert:
+                - paramNme: task
+                  paramTyp: NORMAL
+                  paramVal: "{mart_task_val}"
+                - paramNme: targetTable
+                  paramTyp: ENTITY
+                  paramVal: "{mart_table}"
+                  paramEtlDirectionTyp: TRG
+                - paramNme: tbl_{hub_name}
+                  paramTyp: TABLE_NAME
+                  paramVal: "{hub_table}"
+                  paramEtlDirectionTyp: SRC
+                - paramNme: tbl_{sat_name}
+                  paramTyp: TABLE_NAME
+                  paramVal: "{sat_table}"
+                  paramEtlDirectionTyp: SRC
+                - paramNme: common_application
+                  paramTyp: PARAMETER_GROUP
+                  paramVal: "{common_app}"
+                - paramNme: application
+                  paramTyp: PARAMETER_GROUP
+                  paramVal: "{app_transform}"
+                - paramNme: mode
+                  paramTyp: NORMAL
+                  paramVal: "append"
+            conditions:
+              upsert:
+                - depTyp: "parentTasks"
+                  depParents:
+                    - "{sat_tsk}"
+            taskRestartRuleLinks:
+              add:
+                - {restart_rule}'''
+        return yaml_template
 
     def generate_and_save(self):
         yaml_text = self.entities_edit.toPlainText().strip()
@@ -437,20 +455,10 @@ body:
             QMessageBox.warning(self, "Неполные данные", f"Не найдены сущности: {', '.join(missing)}")
             return
 
-        src = classified['source']
-        if src.get('dsNme') != 'tgo2':
-            reply = QMessageBox.warning(
-                self, "Некорректная схема источника",
-                f"У сущности источника dsNme = '{src.get('dsNme')}', ожидается 'tgo2'.\n"
-                "Продолжить генерацию? (оркестратор может отклонить workflow)",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply == QMessageBox.No:
-                return
-
         params = {
             'wf_enabled': self.wf_enabled.isChecked(),
             'wf_desc': self.wf_desc.text(),
+            'reference_name': self.ref_name.text().strip(),
             'last_run_time': self.last_run_time.value(),
             'tags': self.tags.text(),
             'task_launcher': self.task_launcher.text(),
@@ -459,6 +467,7 @@ body:
             'common_app': self.common_app.text(),
             'app_transform': self.app_transform.text(),
             'restart_rule': self.restart_rule.text(),
+            'reference_name': self.ref_name.text().strip(),
         }
 
         try:
