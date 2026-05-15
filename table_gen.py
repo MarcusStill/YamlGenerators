@@ -189,7 +189,7 @@ class DataVaultYamlGenerator:
         description_hub: str,
         description_sat: str,
         description_mart: str,
-        hub_hashkey_name: Optional[str] = None,
+        surrogate_key_name: Optional[str] = None,
     ):
         self.domain = domain_name.lower()
         self.prefix = project_prefix.lower() if project_prefix else ""
@@ -216,8 +216,13 @@ class DataVaultYamlGenerator:
         self.desc_sat = description_sat
         self.desc_mart = description_mart
 
+        # Имя первичного ключа источника (первый элемент списка)
+        self.source_pk_name = source_pk[0] if source_pk else "id"
+        # Имя, в которое переименовывается этот ключ в staging/sat (берём из бизнес-ключей СУР)
+        self.surrogate_key_name = surrogate_key_name or "id_pk_iar"
+
         base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
-        self.hub_hashkey_name = hub_hashkey_name or f"{base}_hashkey"
+        self.hub_hashkey_name = f"{base}_hashkey"
         self._validate()
 
     def _validate(self):
@@ -225,10 +230,10 @@ class DataVaultYamlGenerator:
         for bk in self.business_keys:
             if bk not in src_names:
                 raise ValueError(f"Бизнес-ключ '{bk}' не найден в атрибутах источника")
-        for pk in self.source_pk:
-            if pk not in src_names:
-                raise ValueError(f"Первичный ключ источника '{pk}' не найден в атрибутах источника")
+        if self.source_pk_name not in src_names:
+            raise ValueError(f"Первичный ключ источника '{self.source_pk_name}' не найден в атрибутах источника")
 
+    # ------------------ Вспомогательные методы ------------------
     @staticmethod
     def _map_pg_to_hive(attr: SourceAttribute) -> Tuple[str, int, int]:
         t = attr.pg_type.lower()
@@ -315,8 +320,13 @@ class DataVaultYamlGenerator:
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
                 desc=tech["desc"], mandatory=True, tech=True))
-        base_name = self.source_table.replace('v$', '').replace('tgo_', '')
-        entity_name = f"tgo2_{base_name}"
+        # Очищаем имя таблицы от схемы и префиксов
+        raw_name = self.source_table.replace('v$', '').replace('tgo_', '')
+        if '.' in raw_name:
+            raw_name = raw_name.split('.')[-1]
+        # Берём префикс из dsNme источника (например, "tgo" или "tgo2")
+        prefix = self.source_ds.strip()
+        entity_name = f"{prefix}_{raw_name}" if prefix else raw_name
         return {
             "entityNme": entity_name,
             "cpNmeUnq": self.hive_cp,
@@ -331,30 +341,51 @@ class DataVaultYamlGenerator:
 
     def _build_staging_body(self) -> dict:
         attrs = []
+
+        # 1. Первичный ключ staging – переименованный source_pk_name
+        pk_attr = next((a for a in self.source_attrs if a.name == self.source_pk_name), None)
+        if pk_attr:
+            hive_type, length, prec = self._map_pg_to_hive(pk_attr)
+            attrs.append(self._make_attr_dict(
+                name=self.surrogate_key_name,
+                pk_flag=True,
+                typ=hive_type,
+                length=length,
+                prec=prec,
+                desc=pk_attr.comment,
+                mandatory=True
+            ))
+
+        # 2. Остальные бизнес-ключи (исключая source_pk_name)
         for bk in self.business_keys:
-            src_attr = next(a for a in self.source_attrs if a.name == bk)
-            hive_type, length, prec = self._map_pg_to_hive(src_attr)
-            attrs.append(self._make_attr_dict(
-                name=bk, pk_flag=True, typ=hive_type, length=length, prec=prec,
-                desc=src_attr.comment, mandatory=True))
-        id_attr = next((a for a in self.source_attrs if a.name == "id"), None)
-        if id_attr:
-            hive_type, length, prec = self._map_pg_to_hive(id_attr)
-            attrs.append(self._make_attr_dict(
-                name="id_pk_iar", pk_flag=False, typ=hive_type, length=length, prec=prec,
-                desc=id_attr.comment, mandatory=False))
+            if bk == self.source_pk_name:
+                continue
+            src_attr = next((a for a in self.source_attrs if a.name == bk), None)
+            if src_attr:
+                hive_type, length, prec = self._map_pg_to_hive(src_attr)
+                attrs.append(self._make_attr_dict(
+                    name=bk, pk_flag=True, typ=hive_type, length=length, prec=prec,
+                    desc=src_attr.comment, mandatory=True
+                ))
+
+        # 3. Все остальные атрибуты (не ключевые)
         for attr in self.source_attrs:
-            if attr.name in self.business_keys or attr.name == "id":
+            if attr.name == self.source_pk_name or attr.name in self.business_keys:
                 continue
             hive_type, length, prec = self._map_pg_to_hive(attr)
             attrs.append(self._make_attr_dict(
                 name=attr.name, pk_flag=False, typ=hive_type, length=length, prec=prec,
-                desc=attr.comment, mandatory=False))
+                desc=attr.comment, mandatory=False
+            ))
+
+        # 4. Технические поля + секционирование
         for tech in self._get_tech_fields(with_partition=True):
             is_part = tech.get("is_part", False)
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
-                desc=tech["desc"], mandatory=True, tech=True, part=is_part))
+                desc=tech["desc"], mandatory=True, tech=True, part=is_part
+            ))
+
         base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
         entity_name = f"staging_{base}"
         return {
@@ -371,23 +402,39 @@ class DataVaultYamlGenerator:
 
     def _build_hub_body(self) -> dict:
         attrs = []
-        # Хэш-ключ – единый для хаба и сателлита
+        # Хэш-ключ
         attrs.append(self._make_attr_dict(
-            name=self.hub_hashkey_name,
-            pk_flag=True,
-            typ="string",
-            length=0,
-            prec=0,
-            desc=f"Хэш-ключ {self.desc_hub.lower()}",
-            mandatory=True
+            name=self.hub_hashkey_name, pk_flag=True, typ="string", length=0, prec=0,
+            desc=f"Хэш-ключ {self.desc_hub.lower()}", mandatory=True
         ))
-        for bk in self.business_keys:
-            src_attr = next(a for a in self.source_attrs if a.name == bk)
-            hive_type, length, prec = self._map_pg_to_hive(src_attr)
+
+        # Бизнес-ключ id_pk_iar (переименованный source_pk)
+        pk_attr = next((a for a in self.source_attrs if a.name == self.source_pk_name), None)
+        if pk_attr:
+            hive_type, length, prec = self._map_pg_to_hive(pk_attr)
             attrs.append(self._make_attr_dict(
-                name=bk, pk_flag=False, typ=hive_type, length=length, prec=prec,
-                desc=src_attr.comment, mandatory=False
+                name=self.surrogate_key_name,
+                pk_flag=False,
+                typ=hive_type,
+                length=length,
+                prec=prec,
+                desc=pk_attr.comment,
+                mandatory=False
             ))
+
+        # Другие бизнес-ключи (если есть)
+        for bk in self.business_keys:
+            if bk == self.source_pk_name:
+                continue
+            src_attr = next((a for a in self.source_attrs if a.name == bk), None)
+            if src_attr:
+                hive_type, length, prec = self._map_pg_to_hive(src_attr)
+                attrs.append(self._make_attr_dict(
+                    name=bk, pk_flag=False, typ=hive_type, length=length, prec=prec,
+                    desc=src_attr.comment, mandatory=False
+                ))
+
+        # Служебные поля
         attrs.append(self._make_attr_dict(
             name="load_date", pk_flag=False, typ="timestamp", length=0, prec=0,
             desc="Дата загрузки", mandatory=False
@@ -396,11 +443,14 @@ class DataVaultYamlGenerator:
             name="record_source", pk_flag=False, typ="string", length=0, prec=0,
             desc="Источник записи", mandatory=False
         ))
+
+        # Технические поля
         for tech in self._get_tech_fields(with_partition=False):
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
                 desc=tech["desc"], mandatory=True, tech=True
             ))
+
         base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
         entity_name = f"domain_{base}_hub"
         return {
@@ -432,18 +482,22 @@ class DataVaultYamlGenerator:
         attrs.append(self._make_attr_dict(
             name="is_deleted", pk_flag=False, typ="boolean", length=0, prec=0,
             desc="Признак удаления записи", mandatory=False))
+
+        # Все неключевые атрибуты (кроме source_pk_name и бизнес-ключей)
         for attr in self.source_attrs:
-            if attr.name in self.business_keys:
+            if attr.name == self.source_pk_name or attr.name in self.business_keys:
                 continue
             hive_type, length, prec = self._map_pg_to_hive(attr)
-            name_in_sat = "id_pk_iar" if attr.name == "id" else attr.name
+            # Оставляем исходное имя, не переименовываем
             attrs.append(self._make_attr_dict(
-                name=name_in_sat, pk_flag=False, typ=hive_type, length=length, prec=prec,
+                name=attr.name, pk_flag=False, typ=hive_type, length=length, prec=prec,
                 desc=attr.comment, mandatory=False))
+
         for tech in self._get_tech_fields(with_partition=False):
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
                 desc=tech["desc"], mandatory=True, tech=True))
+
         base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
         entity_name = f"domain_{base}_sat"
         return {
@@ -493,8 +547,28 @@ class DataVaultYamlGenerator:
             "attributes": {"upsert": attrs},
         }
 
-    # ------------------ Рендеринг YAML ------------------
+    # ------------------ Рендеринг YAML (исправленный) ------------------
     def _render_yaml_block(self, body: dict, is_source: bool = False) -> str:
+        # Функция очистки от Ellipsis и None
+        def sanitize(obj):
+            if obj is Ellipsis:
+                return "..."
+            if obj is None:
+                return ""
+            if isinstance(obj, dict):
+                return {k: sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [sanitize(item) for item in obj]
+            if isinstance(obj, (int, float, bool)):
+                return obj
+            return str(obj)
+
+        # Проверка, что body – словарь (если нет, создаём пустой)
+        if not isinstance(body, dict):
+            body = {}
+
+        body = sanitize(body)
+
         def wrap_strings(obj):
             if isinstance(obj, dict):
                 return {k: wrap_strings(v) for k, v in obj.items()}
@@ -753,6 +827,7 @@ class MainWindow(QMainWindow):
         sur_data = self.sur_text.toPlainText().strip()
         source_header = self.source_header_edit.text().strip()
         sur_header = self.sur_header_edit.text().strip()
+
         if source_header:
             source_data = source_header + "\n" + source_data
         if sur_header:
@@ -789,6 +864,9 @@ class MainWindow(QMainWindow):
         desc_sat = self.desc_sat.toPlainText().strip()
         desc_mart = self.desc_mart.toPlainText().strip()
 
+        # Вычисляем имя для переименованного первичного ключа источника. Берём первый бизнес-ключ из sur_bk, если он есть.
+        surrogate_key_name = sur_bk[0] if sur_bk else "id_pk_iar"
+
         # Валидация
         if not source_data:
             QMessageBox.warning(self, "Ошибка", "Введите текст исходных данных")
@@ -807,7 +885,6 @@ class MainWindow(QMainWindow):
         try:
             source_attrs = parse_source_from_confluence(source_data)
             sur_attrs = parse_sur_from_confluence(sur_data)
-            # Отладка: вывести первые комментарии
             self.log(f"source комментарии: {[(a.name, a.comment) for a in source_attrs[:5]]}")
             self.log(f"sur комментарии: {[(a.name, a.comment) for a in sur_attrs[:5]]}")
         except Exception as e:
@@ -815,10 +892,26 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка парсинга", str(e))
             return
 
+        # Очистка комментариев от Ellipsis и None
+        for a in source_attrs:
+            if a.comment is Ellipsis:
+                a.comment = "..."
+            elif a.comment is None:
+                a.comment = ""
+            else:
+                a.comment = str(a.comment)
+
+        for sa in sur_attrs:
+            if sa.comment is Ellipsis:
+                sa.comment = "..."
+            elif sa.comment is None:
+                sa.comment = ""
+            else:
+                sa.comment = str(sa.comment)
+
         for sa in sur_attrs:
             sa.is_key = sa.name in sur_bk
 
-        # Генератор
         try:
             generator = DataVaultYamlGenerator(
                 domain_name=domain,
@@ -842,6 +935,7 @@ class MainWindow(QMainWindow):
                 description_hub=desc_hub,
                 description_sat=desc_sat,
                 description_mart=desc_mart,
+                surrogate_key_name=surrogate_key_name,
             )
         except Exception as e:
             self.log(f"Ошибка инициализации генератора: {e}", error=True)
