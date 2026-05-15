@@ -583,7 +583,10 @@ class DataVaultYamlGenerator:
         root["domain"] = DoubleQuotedScalarString("ias_kb")
 
         yaml = YAML()
-        yaml.indent(mapping=2, sequence=2, offset=0)
+        # mapping – отступ для пар ключ-значение (словарей) относительно родительского элемента.
+        # sequence – отступ для элементов списка (- значение) относительно родительского ключа.
+        # offset – дополнительный отступ для всех элементов (сдвиг вправо). Обычно используется для коррекции
+        yaml.indent(mapping=2, sequence=0, offset=0)
         yaml.default_flow_style = False
         stream = StringIO()
         yaml.dump(root, stream)
