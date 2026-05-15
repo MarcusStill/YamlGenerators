@@ -110,14 +110,11 @@ def parse_sur_from_confluence(text: str) -> List[SurAttribute]:
     header_line = lines[0]
     headers = [h.strip() for h in header_line.split('\t')]
 
-    idx_name = None
     idx_type = None
     idx_comment = None
     for i, h in enumerate(headers):
         h_lower = h.lower()
-        if h_lower == 'column name':
-            idx_name = i
-        elif h_lower == 'data type':
+        if h_lower == 'data type':
             idx_type = i
         elif h_lower == 'comment':
             idx_comment = i
@@ -125,11 +122,8 @@ def parse_sur_from_confluence(text: str) -> List[SurAttribute]:
     # Если нет column name или data type, используем предположительные индексы
     if idx_type is None:
         idx_type = 1  # data type обычно второй
-    if idx_name is None:
-        idx_name = 0  # column name обычно первый
 
     # Индексы в строке данных (без первого столбца) на 1 меньше
-    name_pos = idx_name - 1 if idx_name > 0 else None  # в строке данных нет отдельной колонки для имени
     type_pos = idx_type - 1
     comment_pos = idx_comment - 1 if idx_comment is not None else None
 
@@ -586,7 +580,8 @@ class DataVaultYamlGenerator:
         # mapping – отступ для пар ключ-значение (словарей) относительно родительского элемента.
         # sequence – отступ для элементов списка (- значение) относительно родительского ключа.
         # offset – дополнительный отступ для всех элементов (сдвиг вправо). Обычно используется для коррекции
-        yaml.indent(mapping=2, sequence=0, offset=0)
+        yaml.indent(mapping=2, sequence=2, offset=0)
+        # TODO: баг лишним с отступом в блоке upsert
         yaml.default_flow_style = False
         stream = StringIO()
         yaml.dump(root, stream)
