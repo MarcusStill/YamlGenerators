@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple, Dict
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel,
     QTextEdit, QLineEdit, QPushButton, QFileDialog, QMessageBox, QGroupBox,
-    QPlainTextEdit, QTabWidget, QGridLayout
+    QPlainTextEdit, QTabWidget, QGridLayout, QCheckBox
 )
 from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
@@ -184,6 +184,7 @@ class DataVaultYamlGenerator:
         description_sat: str,
         description_mart: str,
         surrogate_key_name: Optional[str] = None,
+        skip_validation: bool = False
     ):
         self.domain = domain_name.lower()
         self.prefix = project_prefix.lower() if project_prefix else ""
@@ -217,7 +218,9 @@ class DataVaultYamlGenerator:
 
         base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
         self.hub_hashkey_name = f"{base}_hashkey"
-        self._validate()
+        self.skip_validation = skip_validation
+        if not skip_validation:
+            self._validate()
 
     def _validate(self):
         src_names = {a.name for a in self.source_attrs}
@@ -807,6 +810,32 @@ class MainWindow(QMainWindow):
         group_desc.setLayout(desc_layout)
         layout.addWidget(group_desc)
 
+        # Группа выбора генерируемых сущностей
+        group_entities = QGroupBox("Генерируемые сущности")
+        entities_layout = QGridLayout()
+        self.cb_source = QCheckBox("source")
+        self.cb_snapshot = QCheckBox("snapshot")
+        self.cb_staging = QCheckBox("staging")
+        self.cb_hub = QCheckBox("hub")
+        self.cb_sat = QCheckBox("sat")
+        self.cb_mart = QCheckBox("mart")
+        # По умолчанию все включены
+        self.cb_source.setChecked(True)
+        self.cb_snapshot.setChecked(True)
+        self.cb_staging.setChecked(True)
+        self.cb_hub.setChecked(True)
+        self.cb_sat.setChecked(True)
+        self.cb_mart.setChecked(True)
+
+        entities_layout.addWidget(self.cb_source, 0, 0)
+        entities_layout.addWidget(self.cb_snapshot, 0, 1)
+        entities_layout.addWidget(self.cb_staging, 0, 2)
+        entities_layout.addWidget(self.cb_hub, 1, 0)
+        entities_layout.addWidget(self.cb_sat, 1, 1)
+        entities_layout.addWidget(self.cb_mart, 1, 2)
+        group_entities.setLayout(entities_layout)
+        layout.addWidget(group_entities)
+
         # Кнопка
         self.generate_btn = QPushButton("Сгенерировать и сохранить...")
         self.generate_btn.clicked.connect(self.generate_and_save)
@@ -820,26 +849,78 @@ class MainWindow(QMainWindow):
         self.log_text.append(prefix + msg)
 
     def generate_and_save(self):
-        # Сбор данных
-        source_data = self.source_text.toPlainText().strip()
-        sur_data = self.sur_text.toPlainText().strip()
-        source_header = self.source_header_edit.text().strip()
-        sur_header = self.sur_header_edit.text().strip()
+        # Определяем, какие сущности нужно генерировать
+        gen_source = self.cb_source.isChecked()
+        gen_snapshot = self.cb_snapshot.isChecked()
+        gen_staging = self.cb_staging.isChecked()
+        gen_hub = self.cb_hub.isChecked()
+        gen_sat = self.cb_sat.isChecked()
+        gen_mart = self.cb_mart.isChecked()
 
-        if source_header:
-            source_data = source_header + "\n" + source_data
-        if sur_header:
-            sur_data = sur_header + "\n" + sur_data
+        if not any([gen_source, gen_snapshot, gen_staging, gen_hub, gen_sat, gen_mart]):
+            QMessageBox.warning(self, "Ошибка", "Не выбрано ни одной сущности для генерации")
+            return
 
+        # Если нужны source/snapshot/staging/hub/sat – обязательно наличие исходных данных
+        need_source_data = gen_source or gen_snapshot or gen_staging or gen_hub or gen_sat
+
+        # Сбор текста исходных данных (если нужен)
+        source_data = ""
+        source_header = ""
+        if need_source_data:
+            source_data = self.source_text.toPlainText().strip()
+            source_header = self.source_header_edit.text().strip()
+            if source_header:
+                source_data = source_header + "\n" + source_data
+            if not source_data:
+                QMessageBox.warning(self, "Ошибка",
+                                    "Для выбранных сущностей (source/snapshot/staging/hub/sat) необходимо ввести текст исходных данных")
+                return
+
+        # Данные СУР нужны, если генерируется mart
+        sur_data = ""
+        sur_header = ""
+        if gen_mart:
+            sur_data = self.sur_text.toPlainText().strip()
+            sur_header = self.sur_header_edit.text().strip()
+            if sur_header:
+                sur_data = sur_header + "\n" + sur_data
+            if not sur_data:
+                QMessageBox.warning(self, "Ошибка", "Для генерации mart необходимо ввести текст СУР")
+                return
+
+        # Парсим source_attrs, только если нужны source-сущности
+        source_attrs = []
+        if need_source_data:
+            try:
+                source_attrs = parse_source_from_confluence(source_data)
+            except Exception as e:
+                self.log(f"Ошибка парсинга исходных данных: {e}", error=True)
+                QMessageBox.critical(self, "Ошибка парсинга", str(e))
+                return
+
+        # Парсим sur_attrs, если нужен mart
+        sur_attrs = []
+        if gen_mart:
+            try:
+                sur_attrs = parse_sur_from_confluence(sur_data)
+            except Exception as e:
+                self.log(f"Ошибка парсинга СУР: {e}", error=True)
+                QMessageBox.critical(self, "Ошибка парсинга", str(e))
+                return
+
+        # Бизнес-ключи
         source_bk = [k.strip() for k in self.source_business_keys.text().split(",") if k.strip()]
         sur_bk = [k.strip() for k in self.sur_business_keys.text().split(",") if k.strip()]
 
+        # Параметры source (PostgreSQL)
         source_cp = self.source_cp.text().strip()
         source_ds = self.source_ds.text().strip()
         source_ds_desc = self.source_ds_desc.toPlainText().strip()
         if not source_cp:
             source_cp = "cp_[postgresql]_[pk_iar]_[tm]_[readwrite]"
 
+        # Параметры Hive
         hive_cp = self.hive_cp.text().strip()
         hive_ds_snapshot = self.hive_ds_snapshot.text().strip()
         hive_ds_other = self.hive_ds_other.text().strip()
@@ -848,6 +929,7 @@ class MainWindow(QMainWindow):
         if not hive_cp:
             hive_cp = "cp_[adh3_hive]_[dp_dsb]_[]_[]"
 
+        # Имена и префиксы
         project_prefix = self.project_prefix.text().strip()
         domain = self.domain_name.text().strip()
         source_table = self.source_table_name.text().strip()
@@ -855,6 +937,7 @@ class MainWindow(QMainWindow):
         if not source_pk:
             source_pk = ["id"]
 
+        # Описания сущностей
         desc_source = self.desc_source.toPlainText().strip()
         desc_snapshot = self.desc_snapshot.toPlainText().strip()
         desc_staging = self.desc_staging.toPlainText().strip()
@@ -862,66 +945,31 @@ class MainWindow(QMainWindow):
         desc_sat = self.desc_sat.toPlainText().strip()
         desc_mart = self.desc_mart.toPlainText().strip()
 
-        # Вычисляем имя для переименованного первичного ключа источника. Берём первый бизнес-ключ из sur_bk, если он есть.
-        surrogate_key_name = sur_bk[0] if sur_bk else "id_pk_iar"
-
-        # Валидация
-        if not source_data:
-            QMessageBox.warning(self, "Ошибка", "Введите текст исходных данных")
-            return
-        if not sur_data:
-            QMessageBox.warning(self, "Ошибка", "Введите текст СУР")
-            return
-        if not source_bk:
-            QMessageBox.warning(self, "Ошибка", "Укажите бизнес-ключи для исходных данных")
-            return
-        if not source_table or not domain:
+        # Валидация: если нужны source-сущности, но не заданы source_table или domain
+        if need_source_data and (not source_table or not domain):
             QMessageBox.warning(self, "Ошибка", "Укажите имя исходной таблицы и домен")
             return
 
-        # Парсинг
-        try:
-            source_attrs = parse_source_from_confluence(source_data)
-            sur_attrs = parse_sur_from_confluence(sur_data)
-            self.log(f"source комментарии: {[(a.name, a.comment) for a in source_attrs[:5]]}")
-            self.log(f"sur комментарии: {[(a.name, a.comment) for a in sur_attrs[:5]]}")
-        except Exception as e:
-            self.log(f"Ошибка парсинга: {e}", error=True)
-            QMessageBox.critical(self, "Ошибка парсинга", str(e))
-            return
-
-        # Очистка комментариев от Ellipsis и None
-        for a in source_attrs:
-            if a.comment is Ellipsis:
-                a.comment = "..."
-            elif a.comment is None:
-                a.comment = ""
-            else:
-                a.comment = str(a.comment)
-
-        for sa in sur_attrs:
-            if sa.comment is Ellipsis:
-                sa.comment = "..."
-            elif sa.comment is None:
-                sa.comment = ""
-            else:
-                sa.comment = str(sa.comment)
-
+        # Подготовка бизнес-ключей для СУР
         for sa in sur_attrs:
             sa.is_key = sa.name in sur_bk
 
+        # Имя для переименованного первичного ключа источника (берем первый бизнес-ключ СУР)
+        surrogate_key_name = sur_bk[0] if sur_bk else "id_pk_iar"
+
+        # Создаём генератор
         try:
             generator = DataVaultYamlGenerator(
-                domain_name=domain,
-                project_prefix=project_prefix,
-                source_table=source_table,
-                source_pk=source_pk,
-                business_keys=source_bk,
+                domain_name=domain if need_source_data else "dummy",
+                project_prefix=project_prefix if need_source_data else "",
+                source_table=source_table if need_source_data else "",
+                source_pk=source_pk if need_source_data else [],
+                business_keys=source_bk if need_source_data else [],
                 source_attrs=source_attrs,
                 sur_attrs=sur_attrs,
-                source_cp=source_cp,
-                source_ds=source_ds,
-                source_ds_desc=source_ds_desc,
+                source_cp=source_cp if need_source_data else "",
+                source_ds=source_ds if need_source_data else "",
+                source_ds_desc=source_ds_desc if need_source_data else "",
                 hive_cp=hive_cp,
                 hive_ds_snapshot=hive_ds_snapshot,
                 hive_ds_other=hive_ds_other,
@@ -934,20 +982,36 @@ class MainWindow(QMainWindow):
                 description_sat=desc_sat,
                 description_mart=desc_mart,
                 surrogate_key_name=surrogate_key_name,
+                skip_validation=not need_source_data  # если только mart – пропускаем валидацию source
             )
         except Exception as e:
             self.log(f"Ошибка инициализации генератора: {e}", error=True)
             QMessageBox.critical(self, "Ошибка", str(e))
             return
 
+        # Выбор папки для сохранения
         folder = QFileDialog.getExistingDirectory(self, "Выберите папку для сохранения YAML файлов")
         if not folder:
             return
 
+        # Сохраняем только выбранные сущности
         try:
-            generator.save_all(folder)
+            out_path = Path(folder)
+            out_path.mkdir(parents=True, exist_ok=True)
+            if gen_source:
+                out_path.joinpath("source.yaml").write_text(generator.generate_source(), encoding="utf-8")
+            if gen_snapshot:
+                out_path.joinpath("snapshot.yaml").write_text(generator.generate_snapshot(), encoding="utf-8")
+            if gen_staging:
+                out_path.joinpath("staging.yaml").write_text(generator.generate_staging(), encoding="utf-8")
+            if gen_hub:
+                out_path.joinpath("hub.yaml").write_text(generator.generate_hub(), encoding="utf-8")
+            if gen_sat:
+                out_path.joinpath("sat.yaml").write_text(generator.generate_sat(), encoding="utf-8")
+            if gen_mart:
+                out_path.joinpath("mart.yaml").write_text(generator.generate_mart(), encoding="utf-8")
             self.log(f"YAML файлы сохранены в {folder}")
-            QMessageBox.information(self, "Готово", f"YAML файлы сохранены в папку:\n{folder}")
+            QMessageBox.information(self, "Готово", f"Выбранные YAML файлы сохранены в папку:\n{folder}")
         except Exception as e:
             self.log(f"Ошибка сохранения: {e}", error=True)
             QMessageBox.critical(self, "Ошибка", str(e))
