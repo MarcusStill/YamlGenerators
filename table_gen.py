@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple, Dict
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel,
     QTextEdit, QLineEdit, QPushButton, QFileDialog, QMessageBox, QGroupBox,
-    QPlainTextEdit, QTabWidget, QGridLayout, QCheckBox
+    QPlainTextEdit, QTabWidget, QGridLayout, QCheckBox, QComboBox
 )
 from ruamel.yaml import YAML
 from ruamel.yaml.scalarstring import DoubleQuotedScalarString
@@ -728,8 +728,81 @@ class MainWindow(QMainWindow):
         self.sur_business_keys.setPlaceholderText("например: punkt")
         layout.addWidget(self.sur_business_keys)
 
+        # Переключатель режимов ввода
+        self.sur_input_mode = QComboBox()
+        self.sur_input_mode.addItems(["Confluence (двустрочный формат)", "CSV (таблица с колонками)"])
+        self.sur_input_mode.currentIndexChanged.connect(self.on_sur_input_mode_changed)
+        layout.addWidget(QLabel("Режим ввода данных СУР:"))
+        layout.addWidget(self.sur_input_mode)
+
+        # Поле для CSV (изначально скрыто)
+        self.sur_csv_text = QTextEdit()
+        self.sur_csv_text.setPlaceholderText(
+            "Вставьте CSV-таблицу с разделителем табуляции или запятой.\n"
+            "Ожидаемые колонки: Column Name, Not Null, Data Type, Description, Length, Scale"
+        )
+        self.sur_csv_load_btn = QPushButton("Загрузить CSV из файла")
+        self.sur_csv_load_btn.clicked.connect(self.load_sur_csv_file)
+        self.sur_csv_load_btn.hide()  # изначально скрыта, показываем только в CSV-режиме
+        layout.addWidget(self.sur_csv_load_btn)
+
+        self.sur_csv_text.setMinimumHeight(250)
+        self.sur_csv_text.hide()
+        layout.addWidget(self.sur_csv_text)
+
+        # Сохраняем ссылки на виджеты Confluence, чтобы их скрывать/показывать
+        self.sur_text_label = QLabel("Текст таблицы (без заголовка):")
+        self.sur_header_label = QLabel("Заголовок таблицы (будет добавлен сверху):")
+
         layout.addStretch()
         return tab
+
+    def on_sur_input_mode_changed(self, index):
+        if index == 0:  # Confluence
+            self.sur_csv_load_btn.hide()
+            self.sur_text_label.show()
+            self.sur_text.show()
+            self.sur_header_label.show()
+            self.sur_header_edit.show()
+            self.sur_csv_text.hide()
+        else:  # CSV
+            self.sur_csv_load_btn.show()
+            self.sur_text_label.hide()
+            self.sur_text.hide()
+            self.sur_header_label.hide()
+            self.sur_header_edit.hide()
+            self.sur_csv_text.show()
+
+    def load_sur_csv_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Выберите CSV-файл", "", "CSV files (*.csv);;All files (*.*)")
+        if not file_path:
+            return
+
+        # Читаем файл в бинарном виде и пробуем разные кодировки
+        with open(file_path, 'rb') as f:
+            raw_data = f.read()
+
+        # Список кодировок в порядке приоритета
+        encodings = ['utf-8-sig', 'utf-16', 'utf-16-le', 'utf-16-be', 'cp1251', 'latin-1']
+        content = None
+        used_encoding = None
+        for enc in encodings:
+            try:
+                content = raw_data.decode(enc)
+                used_encoding = enc
+                break
+            except UnicodeDecodeError:
+                continue
+
+        if content is None:
+            QMessageBox.critical(self, "Ошибка",
+                                 "Не удалось определить кодировку файла. Попробуйте сохранить CSV в UTF-8.")
+            return
+
+        self.log(f"CSV файл загружен, кодировка {used_encoding}, размер {len(content)} символов.")
+        # Отображаем первые 200 символов для диагностики
+        self.log(f"Первые 200 символов:\n{content[:200]}")
+        self.sur_csv_text.setPlainText(content)
 
     # ---- вкладка настроек ----
     def _create_config_tab(self) -> QWidget:
@@ -848,6 +921,102 @@ class MainWindow(QMainWindow):
         prefix = "[ОШИБКА] " if error else "[INFO] "
         self.log_text.append(prefix + msg)
 
+    def parse_sur_csv(self, csv_text: str) -> List[SurAttribute]:
+        lines = [line.strip() for line in csv_text.splitlines() if line.strip()]
+        if not lines:
+            self.log("CSV текст пуст.", error=True)
+            raise ValueError("CSV текст пуст.")
+
+        # Пробуем разные разделители
+        possible_delimiters = ['\t', ',', ';', '|']
+        delimiter = None
+        for delim in possible_delimiters:
+            if delim in lines[0]:
+                delimiter = delim
+                break
+        if delimiter is None:
+            self.log(
+                "Не удалось определить разделитель. Попробуйте использовать табуляцию, запятую или точку с запятой.",
+                error=True)
+            raise ValueError("Не удалось определить разделитель.")
+
+        # Разбиваем заголовок
+        headers = [h.strip() for h in lines[0].split(delimiter)]
+        self.log(f"Найден разделитель: '{delimiter}', заголовки: {headers}")
+
+        # Поиск индексов (регистронезависимо)
+        def find_idx(col):
+            for i, h in enumerate(headers):
+                if h.lower() == col.lower():
+                    return i
+            return None
+
+        idx_name = find_idx('column name')
+        idx_notnull = find_idx('not null')
+        idx_type = find_idx('data type')
+        idx_desc = find_idx('description')
+        idx_len = find_idx('length')
+        idx_scale = find_idx('scale')
+
+        # Если не нашли все необходимые колонки, выводим диагностику
+        missing = []
+        if idx_name is None: missing.append('Column Name')
+        if idx_type is None: missing.append('Data Type')
+        if missing:
+            self.log(f"Отсутствуют обязательные колонки: {', '.join(missing)}", error=True)
+            raise ValueError(f"CSV не содержит колонок: {', '.join(missing)}")
+
+        attrs = []
+        for row_num, row in enumerate(lines[1:], start=2):
+            parts = row.split(delimiter)
+            # Если частей меньше, чем максимальный индекс, пропускаем строку
+            max_needed = max(idx_name, idx_type, idx_notnull or 0, idx_desc or 0, idx_len or 0, idx_scale or 0)
+            if len(parts) <= max_needed:
+                self.log(f"Строка {row_num} пропущена (недостаточно колонок: {len(parts)} вместо {max_needed + 1})")
+                continue
+
+            name = parts[idx_name].strip()
+            if not name:
+                continue
+
+            hive_type_raw = parts[idx_type].strip().upper()
+            description = parts[idx_desc].strip() if idx_desc is not None and idx_desc < len(parts) else ''
+            length_str = parts[idx_len].strip() if idx_len is not None and idx_len < len(parts) else ''
+            scale_str = parts[idx_scale].strip() if idx_scale is not None and idx_scale < len(parts) else ''
+
+            # Формируем тип Hive
+            if hive_type_raw == 'DECIMAL':
+                if length_str and length_str != '[NULL]':
+                    try:
+                        length = int(length_str)
+                        scale = int(scale_str) if scale_str and scale_str != '[NULL]' else 0
+                        hive_type = f'decimal({length},{scale})'
+                    except ValueError:
+                        hive_type = 'decimal(38,0)'
+                else:
+                    hive_type = 'decimal(38,0)'
+            elif hive_type_raw == 'STRING':
+                hive_type = 'string'
+            elif hive_type_raw == 'DATE':
+                hive_type = 'date'
+            elif hive_type_raw == 'TIMESTAMP':
+                hive_type = 'timestamp'
+            else:
+                hive_type = 'string'
+
+            attrs.append(SurAttribute(
+                name=name,
+                hive_type=hive_type,
+                comment=description,
+                is_key=False
+            ))
+
+        if not attrs:
+            self.log("Не удалось извлечь ни одного атрибута. Проверьте соответствие колонок и разделитель.", error=True)
+            raise ValueError("Не удалось извлечь ни одного атрибута. Проверьте формат CSV.")
+        self.log(f"Успешно извлечено {len(attrs)} атрибутов из CSV.")
+        return attrs
+
     def generate_and_save(self):
         # Определяем, какие сущности нужно генерировать
         gen_source = self.cb_source.isChecked()
@@ -903,10 +1072,28 @@ class MainWindow(QMainWindow):
         sur_attrs = []
         if gen_mart:
             try:
-                sur_attrs = parse_sur_from_confluence(sur_data)
+                if self.sur_input_mode.currentIndex() == 0:  # Confluence
+                    sur_data = self.sur_text.toPlainText().strip()
+                    sur_header = self.sur_header_edit.text().strip()
+                    if sur_header:
+                        sur_data = sur_header + "\n" + sur_data
+                    if not sur_data:
+                        QMessageBox.warning(self, "Ошибка", "Для генерации mart необходимо ввести текст СУР")
+                        return
+                    sur_attrs = parse_sur_from_confluence(sur_data)
+                else:  # CSV
+                    sur_data = self.sur_csv_text.toPlainText().strip()
+                    if not sur_data:
+                        QMessageBox.warning(self, "Ошибка", "Для генерации mart необходимо ввести CSV данные")
+                        return
+                    sur_attrs = self.parse_sur_csv(sur_data)
             except Exception as e:
                 self.log(f"Ошибка парсинга СУР: {e}", error=True)
                 QMessageBox.critical(self, "Ошибка парсинга", str(e))
+                return
+
+            if not sur_attrs:
+                QMessageBox.critical(self, "Ошибка", "Не удалось извлечь атрибуты из данных СУР. Проверьте ввод.")
                 return
 
         # Бизнес-ключи
