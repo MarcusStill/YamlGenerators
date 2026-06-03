@@ -717,7 +717,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Заголовок таблицы:"))
         self.sur_header_edit = QLineEdit()
-        self.sur_header_edit.setText("column name\tdata type\tidentifier\tnot null\tcomment")
+        self.sur_header_edit.setText("column name\tdata type\tidentity\tcollation\tnot null\tdefault\tcomment")
         layout.addWidget(self.sur_header_edit)
 
         layout.addWidget(QLabel("Бизнес-ключи для СУР (через запятую):"))
