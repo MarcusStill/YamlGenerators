@@ -30,6 +30,8 @@ class SurAttribute:
     hive_type: str    # 'decimal', 'string', 'date', 'timestamp'
     comment: str = ""
     is_key: bool = False
+    length: int = 0   # 'decimal' (precision)
+    scale: int = 0  # 'decimal' (scale)
 
 
 # ----------------------------------------------------------------------
@@ -515,16 +517,18 @@ class DataVaultYamlGenerator:
             if sa.is_key:
                 attrs.append(self._make_attr_dict(
                     name=sa.name, pk_flag=True, typ=sa.hive_type,
-                    length=38 if sa.hive_type == 'decimal' else 0,
-                    prec=0, desc=sa.comment, mandatory=True))
+                    length=sa.length,
+                    prec=sa.scale,
+                    desc=sa.comment, mandatory=True))
         for sa in self.sur_attrs:
             if not sa.is_key:
                 if sa.name == "tbl_part_col":
                     continue
                 attrs.append(self._make_attr_dict(
                     name=sa.name, pk_flag=False, typ=sa.hive_type,
-                    length=38 if sa.hive_type == 'decimal' else 0,
-                    prec=0, desc=sa.comment, mandatory=False))
+                    length=sa.length,
+                    prec=sa.scale,
+                    desc=sa.comment, mandatory=False))
         for tech in self._get_tech_fields(with_partition=True):
             is_part = tech.get("is_part", False)
             attrs.append(self._make_attr_dict(
@@ -968,6 +972,8 @@ class MainWindow(QMainWindow):
 
         attrs = []
         for row_num, row in enumerate(lines[1:], start=2):
+            length = 0
+            scale = 0
             parts = row.split(delimiter)
             # Если частей меньше, чем максимальный индекс, пропускаем строку
             max_needed = max(idx_name, idx_type, idx_notnull or 0, idx_desc or 0, idx_len or 0, idx_scale or 0)
@@ -986,15 +992,17 @@ class MainWindow(QMainWindow):
 
             # Формируем тип Hive
             if hive_type_raw == 'DECIMAL':
+                hive_type = 'decimal'
                 if length_str and length_str != '[NULL]':
                     try:
                         length = int(length_str)
                         scale = int(scale_str) if scale_str and scale_str != '[NULL]' else 0
-                        hive_type = f'decimal({length},{scale})'
                     except ValueError:
-                        hive_type = 'decimal(38,0)'
+                        length = 38
+                        scale = 0
                 else:
-                    hive_type = 'decimal(38,0)'
+                    length = 38
+                    scale = 0
             elif hive_type_raw == 'STRING':
                 hive_type = 'string'
             elif hive_type_raw == 'DATE':
@@ -1008,7 +1016,9 @@ class MainWindow(QMainWindow):
                 name=name,
                 hive_type=hive_type,
                 comment=description,
-                is_key=False
+                is_key=False,
+                length=length,
+                scale=scale
             ))
 
         if not attrs:
