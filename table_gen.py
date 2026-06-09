@@ -669,28 +669,56 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_text)
         self.tabs.addTab(self.log_tab, "Лог")
 
-    # ---- вкладка исходных данных ----
+    # ---- вкладка исходных данных
     def _create_source_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setSpacing(12)
 
-        layout.addWidget(QLabel("Текст таблицы (без заголовка):"))
+        # Существующие виджеты Confluence (оставляем, но они будут скрываться при выборе CSV)
+        self.source_text_label = QLabel("Текст таблицы (без заголовка):")
         self.source_text = QTextEdit()
         self.source_text.setPlaceholderText("Вставьте строки данных (каждая запись в две строки)")
         self.source_text.setMinimumHeight(250)
-        layout.addWidget(self.source_text)
 
-        layout.addWidget(QLabel("Заголовок таблицы (будет добавлен сверху):"))
+        self.source_header_label = QLabel("Заголовок таблицы (будет добавлен сверху):")
         self.source_header_edit = QLineEdit()
         self.source_header_edit.setText("column name\tdata type\tidentity\tcollation\tnot null\tdefault\tcomment")
-        layout.addWidget(self.source_header_edit)
 
-        layout.addWidget(QLabel("Бизнес-ключи (через запятую):"))
+        self.source_business_keys_label = QLabel("Бизнес-ключи (через запятую):")
         self.source_business_keys = QLineEdit()
         self.source_business_keys.setPlaceholderText("например: punkt")
+
+        # Добавляем элементы в layout
+        layout.addWidget(self.source_text_label)
+        layout.addWidget(self.source_text)
+        layout.addWidget(self.source_header_label)
+        layout.addWidget(self.source_header_edit)
+        layout.addWidget(self.source_business_keys_label)
         layout.addWidget(self.source_business_keys)
 
+        # --- Блок для CSV
+        self.source_input_mode = QComboBox()
+        self.source_input_mode.addItems(["Confluence (двустрочный формат)", "CSV (таблица с колонками)"])
+        self.source_input_mode.currentIndexChanged.connect(self.on_source_input_mode_changed)
+        layout.addWidget(QLabel("Режим ввода исходных данных:"))
+        layout.addWidget(self.source_input_mode)
+
+        self.source_csv_text = QTextEdit()
+        self.source_csv_text.setPlaceholderText(
+            "Вставьте CSV-таблицу с разделителем табуляции или запятой.\n"
+            "Ожидаемые колонки: Column Name, Data Type, Not Null, Comment, Length, Scale"
+        )
+        self.source_csv_load_btn = QPushButton("Загрузить CSV из файла")
+        self.source_csv_load_btn.clicked.connect(self.load_source_csv_file)
+        self.source_csv_load_btn.hide()
+        self.source_csv_text.setMinimumHeight(250)
+        self.source_csv_text.hide()
+
+        layout.addWidget(self.source_csv_load_btn)
+        layout.addWidget(self.source_csv_text)
+
+        # Группа параметров подключения source (PostgreSQL) остаётся без изменений
         group_source = QGroupBox("Параметры подключения source (PostgreSQL)")
         src_layout = QGridLayout()
         src_layout.addWidget(QLabel("cpNmeUnq:"), 0, 0)
@@ -709,6 +737,138 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
         return tab
+
+    def on_source_input_mode_changed(self, index):
+        if index == 0:  # Confluence
+            self.source_csv_load_btn.hide()
+            self.source_csv_text.hide()
+            self.source_text_label.show()
+            self.source_text.show()
+            self.source_header_label.show()
+            self.source_header_edit.show()
+            self.source_business_keys_label.show()
+            self.source_business_keys.show()
+        else:  # CSV
+            self.source_csv_load_btn.show()
+            self.source_csv_text.show()
+            self.source_text_label.hide()
+            self.source_text.hide()
+            self.source_header_label.hide()
+            self.source_header_edit.hide()
+            self.source_business_keys_label.show()  # бизнес‑ключи нужны всегда
+            self.source_business_keys.show()
+
+    def load_source_csv_file(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Выберите CSV-файл", "", "CSV files (*.csv);;All files (*.*)")
+        if not file_path:
+            return
+        with open(file_path, 'rb') as f:
+            raw_data = f.read()
+        encodings = ['utf-8-sig', 'utf-16', 'utf-16-le', 'utf-16-be', 'cp1251', 'latin-1']
+        content = None
+        used_encoding = None
+        for enc in encodings:
+            try:
+                content = raw_data.decode(enc)
+                used_encoding = enc
+                break
+            except UnicodeDecodeError:
+                continue
+        if content is None:
+            QMessageBox.critical(self, "Ошибка", "Не удалось определить кодировку файла.")
+            return
+        self.log(f"CSV исходных данных загружен, кодировка {used_encoding}, размер {len(content)} символов.")
+        self.source_csv_text.setPlainText(content)
+
+    def parse_source_csv(self, csv_text: str) -> List[SourceAttribute]:
+        lines = [line.strip() for line in csv_text.splitlines() if line.strip()]
+        if not lines:
+            raise ValueError("CSV текст пуст.")
+        # Определяем разделитель
+        delim = '\t' if '\t' in lines[0] else ',' if ',' in lines[0] else ';'
+        headers = [h.strip() for h in lines[0].split(delim)]
+
+        # Ищем индексы
+        def find(col):
+            for i, h in enumerate(headers):
+                if h.lower() == col.lower():
+                    return i
+            return None
+
+        idx_name = find('column name')
+        idx_type = find('data type')
+        idx_notnull = find('not null')
+        idx_comment = find('description')
+        idx_len = find('length')
+        idx_scale = find('scale')
+        if idx_name is None or idx_type is None:
+            raise ValueError("CSV должен содержать колонки 'Column Name' и 'Data Type'")
+        attrs = []
+        for row_num, row in enumerate(lines[1:], start=2):
+            parts = row.split(delim)
+            if len(parts) <= max(idx_name, idx_type, idx_notnull or 0, idx_comment or 0, idx_len or 0, idx_scale or 0):
+                continue
+            name = parts[idx_name].strip()
+            if not name:
+                continue
+            data_type = parts[idx_type].strip().lower()
+            not_null = parts[idx_notnull].strip().lower() if idx_notnull is not None else 'false'
+            comment = parts[idx_comment].strip() if idx_comment is not None else ''
+            length_str = parts[idx_len].strip() if idx_len is not None and idx_len < len(parts) else ''
+            scale_str = parts[idx_scale].strip() if idx_scale is not None and idx_scale < len(parts) else ''
+            # Формируем тип PostgreSQL
+            if data_type == 'decimal':
+                if length_str and length_str != '[null]':
+                    try:
+                        length = int(length_str)
+                        scale = int(scale_str) if scale_str and scale_str != '[null]' else 0
+                        pg_type = f"numeric({length},{scale})"
+                    except:
+                        pg_type = "numeric(38,0)"
+                else:
+                    pg_type = "numeric(38,0)"
+            elif data_type in ('int', 'int4', 'integer'):
+                pg_type = "int4"
+            elif data_type in ('int8', 'bigint'):
+                pg_type = "int8"
+            elif data_type.startswith('varchar'):
+                if length_str and length_str != '[null]':
+                    pg_type = f"varchar({length_str})"
+                else:
+                    pg_type = "varchar"
+            elif data_type == 'date':
+                pg_type = "date"
+            elif data_type == 'timestamp':
+                pg_type = "timestamp"
+            else:
+                pg_type = data_type
+            # Извлекаем длину/точность для атрибута (нужны для маппинга в Hive)
+            if 'numeric' in pg_type:
+                import re
+                m = re.search(r'\((\d+),(\d+)\)', pg_type)
+                if m:
+                    length = int(m.group(1))
+                    prec = int(m.group(2))
+                else:
+                    length, prec = 38, 0
+            elif 'varchar' in pg_type:
+                m = re.search(r'\((\d+)\)', pg_type)
+                length = int(m.group(1)) if m else 0
+                prec = 0
+            else:
+                length, prec = 0, 0
+            attrs.append(SourceAttribute(
+                name=name,
+                pg_type=pg_type,
+                length=length,
+                prec=prec,
+                comment=comment,
+                nullable=(not_null != 'true')
+            ))
+        if not attrs:
+            raise ValueError("Не удалось извлечь ни одного атрибута из CSV.")
+        self.log(f"Извлечено {len(attrs)} атрибутов исходных данных из CSV.")
+        return attrs
 
     # ---- вкладка СУР ----
     def _create_sur_tab(self) -> QWidget:
@@ -1040,67 +1200,70 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Ошибка", "Не выбрано ни одной сущности для генерации")
             return
 
-        # Если нужны source/snapshot/staging/hub/sat – обязательно наличие исходных данных
         need_source_data = gen_source or gen_snapshot or gen_staging or gen_hub or gen_sat
 
-        # Сбор текста исходных данных (если нужен)
-        source_data = ""
-        source_header = ""
-        if need_source_data:
-            source_data = self.source_text.toPlainText().strip()
-            source_header = self.source_header_edit.text().strip()
-            if source_header:
-                source_data = source_header + "\n" + source_data
-            if not source_data:
-                QMessageBox.warning(self, "Ошибка",
-                                    "Для выбранных сущностей (source/snapshot/staging/hub/sat) необходимо ввести текст исходных данных")
-                return
-
-        # Данные СУР нужны, если генерируется mart
-        sur_data = ""
-        sur_header = ""
-        if gen_mart:
-            sur_data = self.sur_text.toPlainText().strip()
-            sur_header = self.sur_header_edit.text().strip()
-            if sur_header:
-                sur_data = sur_header + "\n" + sur_data
-            if not sur_data:
-                QMessageBox.warning(self, "Ошибка", "Для генерации mart необходимо ввести текст СУР")
-                return
-
-        # Парсим source_attrs, только если нужны source-сущности
+        # Инициализируем переменные
         source_attrs = []
-        if need_source_data:
-            try:
-                source_attrs = parse_source_from_confluence(source_data)
-            except Exception as e:
-                self.log(f"Ошибка парсинга исходных данных: {e}", error=True)
-                QMessageBox.critical(self, "Ошибка парсинга", str(e))
-                return
-
-        # Парсим sur_attrs, если нужен mart
         sur_attrs = []
+
+        # --- Парсинг исходных данных, если нужны source-сущности
+        if need_source_data:
+            # Определяем, какой режим ввода для исходных данных
+            if self.source_input_mode.currentIndex() == 0:  # Confluence
+                source_text = self.source_text.toPlainText().strip()
+                source_header = self.source_header_edit.text().strip()
+                if source_header:
+                    source_text = source_header + "\n" + source_text
+                if not source_text:
+                    QMessageBox.warning(self, "Ошибка",
+                                        "Для выбранных сущностей необходимо ввести текст исходных данных")
+                    return
+                try:
+                    source_attrs = parse_source_from_confluence(source_text)
+                except Exception as e:
+                    self.log(f"Ошибка парсинга исходных данных: {e}", error=True)
+                    QMessageBox.critical(self, "Ошибка парсинга", str(e))
+                    return
+            else:  # CSV
+                source_csv = self.source_csv_text.toPlainText().strip()
+                if not source_csv:
+                    QMessageBox.warning(self, "Ошибка",
+                                        "Для выбранных сущностей необходимо ввести CSV данные")
+                    return
+                try:
+                    source_attrs = self.parse_source_csv(source_csv)
+                except Exception as e:
+                    self.log(f"Ошибка парсинга CSV исходных данных: {e}", error=True)
+                    QMessageBox.critical(self, "Ошибка парсинга", str(e))
+                    return
+
+        # --- Парсинг данных СУР, если нужен mart
         if gen_mart:
-            try:
-                if self.sur_input_mode.currentIndex() == 0:  # Confluence
-                    sur_data = self.sur_text.toPlainText().strip()
-                    sur_header = self.sur_header_edit.text().strip()
-                    if sur_header:
-                        sur_data = sur_header + "\n" + sur_data
-                    if not sur_data:
-                        QMessageBox.warning(self, "Ошибка", "Для генерации mart необходимо ввести текст СУР")
-                        return
-                    sur_attrs = parse_sur_from_confluence(sur_data)
-                else:  # CSV
-                    sur_data = self.sur_csv_text.toPlainText().strip()
-                    if not sur_data:
-                        QMessageBox.warning(self, "Ошибка", "Для генерации mart необходимо ввести CSV данные")
-                        return
-                    sur_attrs = self.parse_sur_csv(sur_data)
-            except Exception as e:
-                self.log(f"Ошибка парсинга СУР: {e}", error=True)
-                QMessageBox.critical(self, "Ошибка парсинга", str(e))
-                return
+            if self.sur_input_mode.currentIndex() == 0:  # Confluence
+                sur_text = self.sur_text.toPlainText().strip()
+                sur_header = self.sur_header_edit.text().strip()
+                if sur_header:
+                    sur_text = sur_header + "\n" + sur_text
+                if not sur_text:
+                    QMessageBox.warning(self, "Ошибка", "Для генерации mart необходимо ввести текст СУР")
+                    return
+                try:
+                    sur_attrs = parse_sur_from_confluence(sur_text)
+                except Exception as e:
+                    self.log(f"Ошибка парсинга СУР: {e}", error=True)
+                    QMessageBox.critical(self, "Ошибка парсинга", str(e))
+                    return
+            else:  # CSV
+                sur_csv = self.sur_csv_text.toPlainText().strip()
+                if not sur_csv:
+                    QMessageBox.warning(self, "Ошибка", "Для генерации mart необходимо ввести CSV данные")
+                    return
+                try:
+                    sur_attrs = self.parse_sur_csv(sur_csv)
+                except Exception as e:
+                    self.log(f"Ошибка парсинга CSV СУР: {e}", error=True)
+                    QMessageBox.critical(self, "Ошибка парсинга", str(e))
+                    return
 
             if not sur_attrs:
                 QMessageBox.critical(self, "Ошибка", "Не удалось извлечь атрибуты из данных СУР. Проверьте ввод.")
@@ -1142,19 +1305,16 @@ class MainWindow(QMainWindow):
         desc_sat = self.desc_sat.toPlainText().strip()
         desc_mart = self.desc_mart.toPlainText().strip()
 
-        # Валидация: если нужны source-сущности, но не заданы source_table или domain
         if need_source_data and (not source_table or not domain):
             QMessageBox.warning(self, "Ошибка", "Укажите имя исходной таблицы и домен")
             return
 
-        # Подготовка бизнес-ключей для СУР
+        # Установка бизнес-ключей для СУР
         for sa in sur_attrs:
             sa.is_key = sa.name in sur_bk
 
-        # Имя для переименованного первичного ключа источника (берем первый бизнес-ключ СУР)
         surrogate_key_name = sur_bk[0] if sur_bk else "id_pk_iar"
 
-        # Создаём генератор
         try:
             generator = DataVaultYamlGenerator(
                 domain_name=domain if need_source_data else "dummy",
@@ -1179,19 +1339,17 @@ class MainWindow(QMainWindow):
                 description_sat=desc_sat,
                 description_mart=desc_mart,
                 surrogate_key_name=surrogate_key_name,
-                skip_validation=not need_source_data  # если только mart – пропускаем валидацию source
+                skip_validation=not need_source_data
             )
         except Exception as e:
             self.log(f"Ошибка инициализации генератора: {e}", error=True)
             QMessageBox.critical(self, "Ошибка", str(e))
             return
 
-        # Выбор папки для сохранения
         folder = QFileDialog.getExistingDirectory(self, "Выберите папку для сохранения YAML файлов")
         if not folder:
             return
 
-        # Сохраняем только выбранные сущности
         try:
             out_path = Path(folder)
             out_path.mkdir(parents=True, exist_ok=True)
