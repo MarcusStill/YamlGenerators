@@ -512,6 +512,9 @@ class DataVaultYamlGenerator:
         }
 
     def _build_mart_body(self) -> dict:
+        print(f"[DEBUG] В mart передано sur_attrs: {len(self.sur_attrs)}")
+        print(f"[DEBUG] Имена в sur_attrs: {[a.name for a in self.sur_attrs]}")
+
         attrs = []
         for sa in self.sur_attrs:
             if sa.is_key:
@@ -1137,9 +1140,13 @@ class MainWindow(QMainWindow):
             parts = row.split(delimiter)
             # Если частей меньше, чем максимальный индекс, пропускаем строку
             max_needed = max(idx_name, idx_type, idx_notnull or 0, idx_desc or 0, idx_len or 0, idx_scale or 0)
-            if len(parts) <= max_needed:
-                self.log(f"Строка {row_num} пропущена (недостаточно колонок: {len(parts)} вместо {max_needed + 1})")
-                continue
+            # Дополняем недостающие части пустыми строками
+            while len(parts) <= max_needed:
+                parts.append('')
+
+            # ----- ОТЛАДКА -----
+            if len(parts) < max_needed + 1:
+                self.log(f"Строка {row_num} дополнена пустыми колонками (было {len(parts)}, стало {max_needed + 1})")
 
             name = parts[idx_name].strip()
             if not name:
@@ -1181,10 +1188,18 @@ class MainWindow(QMainWindow):
                 scale=scale
             ))
 
+            # ----- ОТЛАДКА -----
+            if name.startswith('cnt_uch_cbc'):
+                self.log(f"Добавлен атрибут: {name}")
+
         if not attrs:
             self.log("Не удалось извлечь ни одного атрибута. Проверьте соответствие колонок и разделитель.", error=True)
             raise ValueError("Не удалось извлечь ни одного атрибута. Проверьте формат CSV.")
         self.log(f"Успешно извлечено {len(attrs)} атрибутов из CSV.")
+
+        # ----- ОТЛАДКА -----
+        self.log(f"Полный список извлечённых имён: {[a.name for a in attrs]}")
+
         return attrs
 
     def generate_and_save(self):
@@ -1268,6 +1283,11 @@ class MainWindow(QMainWindow):
             if not sur_attrs:
                 QMessageBox.critical(self, "Ошибка", "Не удалось извлечь атрибуты из данных СУР. Проверьте ввод.")
                 return
+
+        # ----- ОТЛАДКА -----
+        self.log(f"Извлечено атрибутов СУР: {len(sur_attrs)}")
+        self.log(f"Имена первых 10: {[a.name for a in sur_attrs[:10]]}")
+        self.log(f"Имена последних 10: {[a.name for a in sur_attrs[-10:]]}")
 
         # Бизнес-ключи
         source_bk = [k.strip() for k in self.source_business_keys.text().split(",") if k.strip()]
