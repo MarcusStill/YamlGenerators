@@ -216,7 +216,7 @@ class DataVaultYamlGenerator:
         # Имя первичного ключа источника (первый элемент списка)
         self.source_pk_name = source_pk[0] if source_pk else "id"
         # Имя, в которое переименовывается этот ключ в staging/sat (берём из бизнес-ключей СУР)
-        self.surrogate_key_name = surrogate_key_name or "id_pk_iar"
+        self.surrogate_key_name = surrogate_key_name
 
         base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
         self.hub_hashkey_name = f"{base}_hashkey"
@@ -1333,7 +1333,7 @@ class MainWindow(QMainWindow):
         for sa in sur_attrs:
             sa.is_key = sa.name in sur_bk
 
-        surrogate_key_name = sur_bk[0] if sur_bk else "id_pk_iar"
+        surrogate_key_name = sur_bk[0] if sur_bk else source_pk[0]
 
         try:
             generator = DataVaultYamlGenerator(
