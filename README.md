@@ -1,7 +1,29 @@
-# YamlGenerators
-Yaml file generators for work project
+# Data Pipeline Tools
 
-Зависимости:
+Набор инструментов для работы с потоками данных, их мониторинга и управления.
+
+## 📦 Состав
+
+### 1. Генераторы YAML
+- **flow_gen.py** - генератор YAML файлов для потоков данных
+- **table_gen.py** - генератор YAML файлов для таблиц данных
+
+### 2. Мониторинг потоков
+- **workflow_monitor.py** - мониторинг статусов потоков на серверах
+
+### 3. Утилиты
+- **kpe_reg.ps1** - PowerShell скрипт для регистрации YAML файлов на серверах
+
+## 🚀 Установка
+
+### Установка зависимостей
+
+#### Генераторы
+```bash
+pip install -r requirements.txt
 ```
-pip install ruamel.yaml PySide6
+
+#### Мониторинг
+```bash
+pip install -r requirements_monitoring.txt
 ```
