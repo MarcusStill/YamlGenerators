@@ -216,10 +216,13 @@ class DataVaultYamlGenerator:
         # Имя первичного ключа источника (первый элемент списка)
         self.source_pk_name = source_pk[0] if source_pk else "id"
         # Имя, в которое переименовывается этот ключ в staging/sat (берём из бизнес-ключей СУР)
-        self.surrogate_key_name = surrogate_key_name
+        self.surrogate_key_name = surrogate_key_name or "id_pk_iar"
 
-        base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
-        self.hub_hashkey_name = f"{base}_hashkey"
+        # Используем имя таблицы без схемы для хэш-ключа
+        hash_base = self.source_table
+        if '.' in hash_base:
+            hash_base = hash_base.split('.')[-1]
+        self.hub_hashkey_name = f"{hash_base}_hashkey"
         self.skip_validation = skip_validation
         if not skip_validation:
             self._validate()
@@ -310,20 +313,27 @@ class DataVaultYamlGenerator:
     def _build_snapshot_body(self) -> dict:
         attrs = []
         for attr in self.source_attrs:
-            hive_type, length, prec = self._map_pg_to_hive(attr)
+            hive_type, _, _ = self._map_pg_to_hive(attr)
             pk_flag = attr.name in self.source_pk
+            # Нормализация для snapshot
+            if hive_type == "decimal":
+                length, prec = 38, 0
+            elif hive_type == "string":
+                length, prec = 0, 0
+            else:
+                length, prec = attr.length, attr.prec
             attrs.append(self._make_attr_dict(
-                name=attr.name, pk_flag=pk_flag, typ=hive_type, length=length, prec=prec,
+                name=attr.name, pk_flag=pk_flag, typ=hive_type,
+                length=length,
+                prec=prec,
                 desc=attr.comment, mandatory=pk_flag))
         for tech in self._get_tech_fields(with_partition=False):
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
                 desc=tech["desc"], mandatory=True, tech=True))
-        # Очищаем имя таблицы от схемы и префиксов
-        raw_name = self.source_table.replace('v$', '').replace('tgo_', '')
+        raw_name = self.source_table
         if '.' in raw_name:
             raw_name = raw_name.split('.')[-1]
-        # Берём префикс из dsNme источника (например, "tgo" или "tgo2")
         prefix = self.source_ds.strip()
         entity_name = f"{prefix}_{raw_name}" if prefix else raw_name
         return {
@@ -344,7 +354,14 @@ class DataVaultYamlGenerator:
         # 1. Первичный ключ staging – переименованный source_pk_name
         pk_attr = next((a for a in self.source_attrs if a.name == self.source_pk_name), None)
         if pk_attr:
-            hive_type, length, prec = self._map_pg_to_hive(pk_attr)
+            hive_type, _, _ = self._map_pg_to_hive(pk_attr)
+            # Нормализация для staging
+            if hive_type == "decimal":
+                length, prec = 38, 0
+            elif hive_type == "string":
+                length, prec = 0, 0
+            else:
+                length, prec = pk_attr.length, pk_attr.prec
             attrs.append(self._make_attr_dict(
                 name=self.surrogate_key_name,
                 pk_flag=True,
@@ -361,9 +378,17 @@ class DataVaultYamlGenerator:
                 continue
             src_attr = next((a for a in self.source_attrs if a.name == bk), None)
             if src_attr:
-                hive_type, length, prec = self._map_pg_to_hive(src_attr)
+                hive_type, _, _ = self._map_pg_to_hive(src_attr)
+                if hive_type == "decimal":
+                    length, prec = 38, 0
+                elif hive_type == "string":
+                    length, prec = 0, 0
+                else:
+                    length, prec = src_attr.length, src_attr.prec
                 attrs.append(self._make_attr_dict(
-                    name=bk, pk_flag=True, typ=hive_type, length=length, prec=prec,
+                    name=bk, pk_flag=True, typ=hive_type,
+                    length=length,
+                    prec=prec,
                     desc=src_attr.comment, mandatory=True
                 ))
 
@@ -371,9 +396,17 @@ class DataVaultYamlGenerator:
         for attr in self.source_attrs:
             if attr.name == self.source_pk_name or attr.name in self.business_keys:
                 continue
-            hive_type, length, prec = self._map_pg_to_hive(attr)
+            hive_type, _, _ = self._map_pg_to_hive(attr)
+            if hive_type == "decimal":
+                length, prec = 38, 0
+            elif hive_type == "string":
+                length, prec = 0, 0
+            else:
+                length, prec = attr.length, attr.prec
             attrs.append(self._make_attr_dict(
-                name=attr.name, pk_flag=False, typ=hive_type, length=length, prec=prec,
+                name=attr.name, pk_flag=False, typ=hive_type,
+                length=length,
+                prec=prec,
                 desc=attr.comment, mandatory=False
             ))
 
@@ -385,8 +418,10 @@ class DataVaultYamlGenerator:
                 desc=tech["desc"], mandatory=True, tech=True, part=is_part
             ))
 
-        base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
-        entity_name = f"staging_{base}"
+        raw_name = self.source_table
+        if '.' in raw_name:
+            raw_name = raw_name.split('.')[-1]
+        entity_name = f"staging_{raw_name}"
         return {
             "entityNme": entity_name,
             "cpNmeUnq": self.hive_cp,
@@ -401,22 +436,24 @@ class DataVaultYamlGenerator:
 
     def _build_hub_body(self) -> dict:
         attrs = []
-        # Хэш-ключ
+        # Хэш-ключ – очищаем описание от переносов и кавычек
+        desc_clean = self.desc_hub.lower().replace('\n', ' ').replace('\r', ' ').replace('"', '')
+        desc_hash = f"Хэш-ключ {desc_clean}"
         attrs.append(self._make_attr_dict(
             name=self.hub_hashkey_name, pk_flag=True, typ="string", length=0, prec=0,
-            desc=f"Хэш-ключ {self.desc_hub.lower()}", mandatory=True
+            desc=desc_hash, mandatory=True
         ))
 
         # Бизнес-ключ id_pk_iar (переименованный source_pk)
         pk_attr = next((a for a in self.source_attrs if a.name == self.source_pk_name), None)
         if pk_attr:
-            hive_type, length, prec = self._map_pg_to_hive(pk_attr)
+            hive_type, _, _ = self._map_pg_to_hive(pk_attr)
             attrs.append(self._make_attr_dict(
                 name=self.surrogate_key_name,
                 pk_flag=False,
                 typ=hive_type,
-                length=length,
-                prec=prec,
+                length=pk_attr.length,
+                prec=pk_attr.prec,
                 desc=pk_attr.comment,
                 mandatory=False
             ))
@@ -427,9 +464,11 @@ class DataVaultYamlGenerator:
                 continue
             src_attr = next((a for a in self.source_attrs if a.name == bk), None)
             if src_attr:
-                hive_type, length, prec = self._map_pg_to_hive(src_attr)
+                hive_type, _, _ = self._map_pg_to_hive(src_attr)
                 attrs.append(self._make_attr_dict(
-                    name=bk, pk_flag=False, typ=hive_type, length=length, prec=prec,
+                    name=bk, pk_flag=False, typ=hive_type,
+                    length=src_attr.length,
+                    prec=src_attr.prec,
                     desc=src_attr.comment, mandatory=False
                 ))
 
@@ -450,8 +489,11 @@ class DataVaultYamlGenerator:
                 desc=tech["desc"], mandatory=True, tech=True
             ))
 
-        base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
-        entity_name = f"domain_{base}_hub"
+        # Имя hub строится на основе source_table (без схемы)
+        raw_name = self.source_table
+        if '.' in raw_name:
+            raw_name = raw_name.split('.')[-1]
+        entity_name = f"domain_{raw_name}_hub"
         return {
             "entityNme": entity_name,
             "cpNmeUnq": self.hive_cp,
@@ -466,39 +508,53 @@ class DataVaultYamlGenerator:
 
     def _build_sat_body(self) -> dict:
         attrs = []
+        # Хэш-ключ – очищаем описание от переносов и кавычек
+        desc_clean = self.desc_hub.lower().replace('\n', ' ').replace('\r', ' ').replace('"', '')
+        desc_hash = f"Хэш-ключ {desc_clean}"
         attrs.append(self._make_attr_dict(
             name=self.hub_hashkey_name, pk_flag=True, typ="string", length=0, prec=0,
-            desc=f"Хэш-ключ {self.desc_hub.lower()}", mandatory=True))
+            desc=desc_hash, mandatory=True
+        ))
         attrs.append(self._make_attr_dict(
             name="load_date", pk_flag=False, typ="timestamp", length=0, prec=0,
-            desc="Дата загрузки", mandatory=False))
+            desc="Дата загрузки", mandatory=False
+        ))
         attrs.append(self._make_attr_dict(
             name="record_source", pk_flag=False, typ="string", length=0, prec=0,
-            desc="Источник записи", mandatory=False))
+            desc="Источник записи", mandatory=False
+        ))
         attrs.append(self._make_attr_dict(
             name="hashdiff", pk_flag=False, typ="string", length=0, prec=0,
-            desc="Хэш данных", mandatory=False))
+            desc="Хэш данных", mandatory=False
+        ))
         attrs.append(self._make_attr_dict(
             name="is_deleted", pk_flag=False, typ="boolean", length=0, prec=0,
-            desc="Признак удаления записи", mandatory=False))
+            desc="Признак удаления записи", mandatory=False
+        ))
 
         # Все неключевые атрибуты (кроме source_pk_name и бизнес-ключей)
         for attr in self.source_attrs:
             if attr.name == self.source_pk_name or attr.name in self.business_keys:
                 continue
-            hive_type, length, prec = self._map_pg_to_hive(attr)
-            # Оставляем исходное имя, не переименовываем
+            hive_type, _, _ = self._map_pg_to_hive(attr)
             attrs.append(self._make_attr_dict(
-                name=attr.name, pk_flag=False, typ=hive_type, length=length, prec=prec,
-                desc=attr.comment, mandatory=False))
+                name=attr.name, pk_flag=False, typ=hive_type,
+                length=attr.length,
+                prec=attr.prec,
+                desc=attr.comment, mandatory=False
+            ))
 
         for tech in self._get_tech_fields(with_partition=False):
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
-                desc=tech["desc"], mandatory=True, tech=True))
+                desc=tech["desc"], mandatory=True, tech=True
+            ))
 
-        base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
-        entity_name = f"domain_{base}_sat"
+        # Имя sat строится на основе source_table (без схемы)
+        raw_name = self.source_table
+        if '.' in raw_name:
+            raw_name = raw_name.split('.')[-1]
+        entity_name = f"domain_{raw_name}_sat"
         return {
             "entityNme": entity_name,
             "cpNmeUnq": self.hive_cp,
@@ -512,9 +568,6 @@ class DataVaultYamlGenerator:
         }
 
     def _build_mart_body(self) -> dict:
-        print(f"[DEBUG] В mart передано sur_attrs: {len(self.sur_attrs)}")
-        print(f"[DEBUG] Имена в sur_attrs: {[a.name for a in self.sur_attrs]}")
-
         attrs = []
         for sa in self.sur_attrs:
             if sa.is_key:
@@ -537,8 +590,12 @@ class DataVaultYamlGenerator:
             attrs.append(self._make_attr_dict(
                 name=tech["name"], pk_flag=False, typ=tech["type"], length=0, prec=0,
                 desc=tech["desc"], mandatory=True, tech=True, part=is_part))
-        base = f"{self.prefix}_{self.domain}" if self.prefix else self.domain
-        entity_name = f"mart_{base}"
+
+        # Имя mart строится на основе source_table (без схемы)
+        raw_name = self.source_table
+        if '.' in raw_name:
+            raw_name = raw_name.split('.')[-1]
+        entity_name = f"mart_{raw_name}"
         return {
             "entityNme": entity_name,
             "cpNmeUnq": self.hive_cp,
@@ -806,6 +863,7 @@ class MainWindow(QMainWindow):
         idx_scale = find('scale')
         if idx_name is None or idx_type is None:
             raise ValueError("CSV должен содержать колонки 'Column Name' и 'Data Type'")
+
         attrs = []
         for row_num, row in enumerate(lines[1:], start=2):
             parts = row.split(delim)
@@ -817,49 +875,51 @@ class MainWindow(QMainWindow):
             data_type = parts[idx_type].strip().lower()
             not_null = parts[idx_notnull].strip().lower() if idx_notnull is not None else 'false'
             comment = parts[idx_comment].strip() if idx_comment is not None else ''
+            # Если комментарий начинается и заканчивается кавычками, убираем их
+            if comment.startswith('"') and comment.endswith('"'):
+                comment = comment[1:-1]
             length_str = parts[idx_len].strip() if idx_len is not None and idx_len < len(parts) else ''
             scale_str = parts[idx_scale].strip() if idx_scale is not None and idx_scale < len(parts) else ''
+
+            length = 0
+            prec = 0
+
             # Формируем тип PostgreSQL
-            if data_type == 'decimal':
+            if data_type in ('decimal', 'numeric'):
+                pg_type = "numeric"
                 if length_str and length_str != '[null]':
                     try:
                         length = int(length_str)
-                        scale = int(scale_str) if scale_str and scale_str != '[null]' else 0
-                        pg_type = f"numeric({length},{scale})"
-                    except:
-                        pg_type = "numeric(38,0)"
+                        prec = int(scale_str) if scale_str and scale_str != '[null]' else 0
+                    except ValueError:
+                        length, prec = 38, 0
                 else:
-                    pg_type = "numeric(38,0)"
+                    length, prec = 38, 0
             elif data_type in ('int', 'int4', 'integer'):
                 pg_type = "int4"
             elif data_type in ('int8', 'bigint'):
                 pg_type = "int8"
             elif data_type.startswith('varchar'):
+                pg_type = "varchar"
                 if length_str and length_str != '[null]':
-                    pg_type = f"varchar({length_str})"
-                else:
-                    pg_type = "varchar"
+                    try:
+                        length = int(length_str)
+                    except ValueError:
+                        length = 0
+            elif data_type in ('char', 'bpchar', 'character'):
+                pg_type = "bpchar"
+                if length_str and length_str != '[null]':
+                    try:
+                        length = int(length_str)
+                    except ValueError:
+                        length = 0
             elif data_type == 'date':
                 pg_type = "date"
             elif data_type == 'timestamp':
                 pg_type = "timestamp"
             else:
                 pg_type = data_type
-            # Извлекаем длину/точность для атрибута (нужны для маппинга в Hive)
-            if 'numeric' in pg_type:
-                import re
-                m = re.search(r'\((\d+),(\d+)\)', pg_type)
-                if m:
-                    length = int(m.group(1))
-                    prec = int(m.group(2))
-                else:
-                    length, prec = 38, 0
-            elif 'varchar' in pg_type:
-                m = re.search(r'\((\d+)\)', pg_type)
-                length = int(m.group(1)) if m else 0
-                prec = 0
-            else:
-                length, prec = 0, 0
+
             attrs.append(SourceAttribute(
                 name=name,
                 pg_type=pg_type,
@@ -981,16 +1041,16 @@ class MainWindow(QMainWindow):
         group_basic = QGroupBox("Основные параметры")
         basic_layout = QGridLayout()
         basic_layout.addWidget(QLabel("Префикс проекта (например 'cl'):"), 0, 0)
-        self.project_prefix = QLineEdit("cl")
+        self.project_prefix = QLineEdit("< требуется заполнить >")
         basic_layout.addWidget(self.project_prefix, 0, 1)
         basic_layout.addWidget(QLabel("Доменное имя (без префикса):"), 1, 0)
-        self.domain_name = QLineEdit("delivery_points_station_codes")
+        self.domain_name = QLineEdit("< требуется заполнить >")
         basic_layout.addWidget(self.domain_name, 1, 1)
         basic_layout.addWidget(QLabel("Имя исходной таблицы (source):"), 2, 0)
-        self.source_table_name = QLineEdit("v$spr_stations")
+        self.source_table_name = QLineEdit("< требуется заполнить >")
         basic_layout.addWidget(self.source_table_name, 2, 1)
         basic_layout.addWidget(QLabel("Первичный ключ источника (через запятую):"), 3, 0)
-        self.source_pk = QLineEdit("punkt")
+        self.source_pk = QLineEdit("< требуется заполнить >")
         basic_layout.addWidget(self.source_pk, 3, 1)
         group_basic.setLayout(basic_layout)
         layout.addWidget(group_basic)
@@ -1025,27 +1085,27 @@ class MainWindow(QMainWindow):
         desc_layout = QGridLayout()
         desc_layout.addWidget(QLabel("source:"), 0, 0)
         self.desc_source = QPlainTextEdit()
-        self.desc_source.setPlainText("Справочник пунктов поставок и кодов станций")
+        self.desc_source.setPlainText("Справочник < требуется заполнить >")
         desc_layout.addWidget(self.desc_source, 0, 1)
         desc_layout.addWidget(QLabel("snapshot:"), 1, 0)
         self.desc_snapshot = QPlainTextEdit()
-        self.desc_snapshot.setPlainText("Справочник пунктов поставок и кодов станций")
+        self.desc_snapshot.setPlainText("Справочник < требуется заполнить >")
         desc_layout.addWidget(self.desc_snapshot, 1, 1)
         desc_layout.addWidget(QLabel("staging:"), 2, 0)
         self.desc_staging = QPlainTextEdit()
-        self.desc_staging.setPlainText("Промежуточный слой для справочника пунктов поставок и кодов станций")
+        self.desc_staging.setPlainText("Промежуточный слой для справочника < требуется заполнить >")
         desc_layout.addWidget(self.desc_staging, 2, 1)
         desc_layout.addWidget(QLabel("hub:"), 3, 0)
         self.desc_hub = QPlainTextEdit()
-        self.desc_hub.setPlainText("Хаб для справочника пунктов поставок и кодов станций")
+        self.desc_hub.setPlainText("Хаб для справочника < требуется заполнить >")
         desc_layout.addWidget(self.desc_hub, 3, 1)
         desc_layout.addWidget(QLabel("sat:"), 4, 0)
         self.desc_sat = QPlainTextEdit()
-        self.desc_sat.setPlainText("Спутник для справочника пунктов поставок и кодов станций")
+        self.desc_sat.setPlainText("Спутник для справочника < требуется заполнить >")
         desc_layout.addWidget(self.desc_sat, 4, 1)
         desc_layout.addWidget(QLabel("mart:"), 5, 0)
         self.desc_mart = QPlainTextEdit()
-        self.desc_mart.setPlainText("Витрина справочника пунктов поставок и кодов станций")
+        self.desc_mart.setPlainText("Витрина справочника < требуется заполнить >")
         desc_layout.addWidget(self.desc_mart, 5, 1)
         group_desc.setLayout(desc_layout)
         layout.addWidget(group_desc)
