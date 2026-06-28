@@ -174,6 +174,7 @@ class DataVaultYamlGenerator:
         source_cp: str,
         source_ds: str,
         source_ds_desc: str,
+        source_dest: str,
         hive_cp: str,
         hive_ds_snapshot: str,
         hive_ds_other: str,
@@ -199,6 +200,7 @@ class DataVaultYamlGenerator:
         self.source_cp = source_cp
         self.source_ds = source_ds
         self.source_ds_desc = source_ds_desc
+        self.source_dest = source_dest
 
         self.hive_cp = hive_cp
         self.hive_ds_snapshot = hive_ds_snapshot
@@ -300,11 +302,11 @@ class DataVaultYamlGenerator:
                 prec=attr.prec, desc=attr.comment, mandatory=False))
         return {
             "entityNme": self.source_table,
-            "cpNmeUnq": self.source_cp,
+            "cpNmeUnq (точка подключения)": self.source_cp,
             "dsNme": self.source_ds,
             "dsDesc": self.source_ds_desc,
             "detNmeUnq": "table",
-            "destNmeUnq": "postgres",
+            "destNmeUnq": self.source_dest,
             "ddmtNmeUnq": "source",
             "entityDesc": self.desc_source,
             "attributes": {"upsert": attrs},
@@ -778,10 +780,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.source_csv_load_btn)
         layout.addWidget(self.source_csv_text)
 
-        # Группа параметров подключения source (PostgreSQL) остаётся без изменений
-        group_source = QGroupBox("Параметры подключения source (PostgreSQL)")
+        # Группа параметров подключения source
+        group_source = QGroupBox("Параметры подключения source (PostgreSQL/hive_orc)")
         src_layout = QGridLayout()
-        src_layout.addWidget(QLabel("cpNmeUnq:"), 0, 0)
+        src_layout.addWidget(QLabel("cpNmeUnq (точка подключения):"), 0, 0)
         self.source_cp = QLineEdit("cp_[postgresql]_[pk_iar]_[tm]_[readwrite]")
         src_layout.addWidget(self.source_cp, 0, 1)
         src_layout.addWidget(QLabel("dsNme:"), 1, 0)
@@ -794,6 +796,9 @@ class MainWindow(QMainWindow):
         src_layout.addWidget(self.source_ds_desc, 2, 1)
         group_source.setLayout(src_layout)
         layout.addWidget(group_source)
+        self.source_dest = QLineEdit("postgres")
+        src_layout.addWidget(QLabel("destNmeUnq:"), 3, 0)
+        src_layout.addWidget(self.source_dest, 3, 1)
 
         layout.addStretch()
         return tab
@@ -1281,9 +1286,18 @@ class MainWindow(QMainWindow):
         source_attrs = []
         sur_attrs = []
 
-        # --- Парсинг исходных данных, если нужны source-сущности
+        # --- ПАРАМЕТРЫ source – инициализируем ДО условных блоков ---
+        source_cp = self.source_cp.text().strip()
+        source_ds = self.source_ds.text().strip()
+        source_ds_desc = self.source_ds_desc.toPlainText().strip()
+        source_dest = self.source_dest.text().strip() if hasattr(self, 'source_dest') else "postgres"
+        if not source_cp:
+            source_cp = "cp_[postgresql]_[pk_iar]_[tm]_[readwrite]"
+        if not source_dest:
+            source_dest = "postgres"
+
+        # --- Парсинг исходных данных, если нужны source-сущности ---
         if need_source_data:
-            # Определяем, какой режим ввода для исходных данных
             if self.source_input_mode.currentIndex() == 0:  # Confluence
                 source_text = self.source_text.toPlainText().strip()
                 source_header = self.source_header_edit.text().strip()
@@ -1312,7 +1326,7 @@ class MainWindow(QMainWindow):
                     QMessageBox.critical(self, "Ошибка парсинга", str(e))
                     return
 
-        # --- Парсинг данных СУР, если нужен mart
+        # --- Парсинг данных СУР, если нужен mart ---
         if gen_mart:
             if self.sur_input_mode.currentIndex() == 0:  # Confluence
                 sur_text = self.sur_text.toPlainText().strip()
@@ -1352,13 +1366,6 @@ class MainWindow(QMainWindow):
         # Бизнес-ключи
         source_bk = [k.strip() for k in self.source_business_keys.text().split(",") if k.strip()]
         sur_bk = [k.strip() for k in self.sur_business_keys.text().split(",") if k.strip()]
-
-        # Параметры source (PostgreSQL)
-        source_cp = self.source_cp.text().strip()
-        source_ds = self.source_ds.text().strip()
-        source_ds_desc = self.source_ds_desc.toPlainText().strip()
-        if not source_cp:
-            source_cp = "cp_[postgresql]_[pk_iar]_[tm]_[readwrite]"
 
         # Параметры Hive
         hive_cp = self.hive_cp.text().strip()
@@ -1407,6 +1414,7 @@ class MainWindow(QMainWindow):
                 source_cp=source_cp if need_source_data else "",
                 source_ds=source_ds if need_source_data else "",
                 source_ds_desc=source_ds_desc if need_source_data else "",
+                source_dest=source_dest,
                 hive_cp=hive_cp,
                 hive_ds_snapshot=hive_ds_snapshot,
                 hive_ds_other=hive_ds_other,
